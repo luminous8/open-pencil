@@ -10,6 +10,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsgo --noEmit && vite build",
+    "build:cf": "vite build && rm -f dist/_redirects",
+    "deploy:cf": "bun run build:cf && npx wrangler deploy"
     "preview": "vite preview",
     "tauri": "tauri",
     "lint": "oxlint -c oxlint.json src/",
