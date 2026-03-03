@@ -8,10 +8,12 @@ Open-source, AI-native design editor. Figma-compatible, AI-first, fully local.
 
 > **What's next**
 >
+> - 100% .fig compatibility — full rendering parity with Figma
+> - Shader effects (SkSL), skewing, native OkHCL color support
+> - Component libraries — publish, share, and consume design systems
 > - Live reload when .fig file changes on disk (MCP server → desktop app workflow)
 > - More AI providers (Anthropic API, Claude Code subscription, Gemini, local models via Ollama)
 > - Code signing (Apple & Azure certificates for properly signed binaries)
-> - Improving .fig compatibility across a larger set of files
 > - CI tools — design linting, code export, visual regression in pipelines
 
 ![OpenPencil](packages/docs/public/screenshot.png)
@@ -61,6 +63,18 @@ Your design files are yours. Your tools should be too.
 | MCP | @modelcontextprotocol/sdk, Hono |
 | Testing | Playwright (visual regression), bun:test (unit) |
 | Tooling | Vite 7, oxlint, oxfmt, typescript-go |
+
+## Installation
+
+Download the latest release from the [releases page](https://github.com/open-pencil/open-pencil/releases/latest), or [use the web app](https://app.openpencil.dev) — no install needed.
+
+> **macOS: "OpenPencil is damaged and can't be opened"**
+>
+> The app is not yet code-signed. After mounting the `.dmg`, run in Terminal:
+> ```sh
+> xattr -cr /Applications/OpenPencil.app
+> ```
+> Then open the app normally. This only needs to be done once.
 
 ## Getting Started
 

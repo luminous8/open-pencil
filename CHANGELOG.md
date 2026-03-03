@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Multi-selection properties panel — edit position, size, appearance, fill, stroke, and effects across multiple selected nodes
+- Shared values display normally, differing values show "Mixed"
+- W/H inputs in multi-selection mode
+- Flip horizontal/vertical using scale transform instead of rotation
+- Single-node alignment aligns to parent frame bounds
+
+### Docs
+
+- Add macOS Gatekeeper workaround (`xattr -cr`) to README and docs for unsigned app warning
+
+### Fixes
+
+- Fix flip buttons using rotation math instead of actual mirroring
+- Fix flip transform encoding — scale first matrix column only (was incorrectly producing 180° rotation)
+- Decode flip state from .fig transform matrix on import
+
+## 0.5.1 — 2026-03-03
+
+### Fixes
+
+- Fix File → Save crash when document has layer blur effects
+
 ## 0.5.0 — 2026-03-03
 
 ### Features
