@@ -1,4 +1,4 @@
-import { reactive, shallowRef, computed, watch } from 'vue'
+import { shallowReactive, shallowRef, computed, watch } from 'vue'
 
 import {
   IS_TAURI,
@@ -7,7 +7,9 @@ import {
   SECTION_DEFAULT_FILL,
   SECTION_DEFAULT_STROKE,
   CANVAS_BG_COLOR,
-  ZOOM_SENSITIVITY
+  ZOOM_DIVISOR,
+  ZOOM_SCALE_MIN,
+  ZOOM_SCALE_MAX
 } from '@/constants'
 import {
   parseFigmaClipboard,
@@ -121,6 +123,8 @@ export function createEditorStore() {
   let downloadName: string | null = null
   let savedVersion = 0
   let autosaveTimer: ReturnType<typeof setTimeout> | undefined
+  let lastWriteTime = 0
+  let unwatchFile: (() => void) | null = null
   let _ck: import('canvaskit-wasm').CanvasKit | null = null
   let _renderer: import('@/engine/renderer').SkiaRenderer | null = null
   let _textEditor: TextEditor | null = null
@@ -142,7 +146,7 @@ export function createEditorStore() {
     }, 100)
   }
 
-  const state = reactive({
+  const state = shallowReactive({
     activeTool: 'SELECT' as Tool,
     currentPageId: graph.getPages()[0].id,
     selectedIds: new Set<string>(),
@@ -182,7 +186,8 @@ export function createEditorStore() {
     panY: 0,
     zoom: 1,
     renderVersion: 0,
-    sceneVersion: 0
+    sceneVersion: 0,
+    loading: false
   })
 
   const AUTOSAVE_DELAY = 3000
@@ -561,6 +566,8 @@ export function createEditorStore() {
 
   async function openFigFile(file: File, handle?: FileSystemFileHandle, path?: string) {
     try {
+      state.loading = true
+      await new Promise((r) => requestAnimationFrame(r))
       const imported = await readFigFile(file)
       graph = imported
       computeAllLayouts(graph)
@@ -578,8 +585,11 @@ export function createEditorStore() {
       state.zoom = 1
       state.pageColor = { ...CANVAS_BG_COLOR }
       requestRender()
+      startWatchingFile()
     } catch (e) {
       console.error('Failed to open .fig file:', e)
+    } finally {
+      state.loading = false
     }
   }
 
@@ -624,6 +634,7 @@ export function createEditorStore() {
           .pop()
           ?.replace(/\.fig$/i, '') ?? 'Untitled'
       await writeFile(data)
+      startWatchingFile()
       return
     }
 
@@ -642,6 +653,7 @@ export function createEditorStore() {
         filePath = null
         state.documentName = handle.name.replace(/\.fig$/i, '')
         await writeFile(data)
+        startWatchingFile()
         return
       } catch (e) {
         if ((e as Error).name === 'AbortError') return
@@ -656,6 +668,7 @@ export function createEditorStore() {
   }
 
   async function writeFile(data: Uint8Array) {
+    lastWriteTime = Date.now()
     if (filePath && IS_TAURI) {
       const { writeFile: tauriWrite } = await import('@tauri-apps/plugin-fs')
       await tauriWrite(filePath, data)
@@ -667,6 +680,88 @@ export function createEditorStore() {
       await writable.write(new Uint8Array(data))
       await writable.close()
       savedVersion = state.sceneVersion
+    }
+  }
+
+  const WATCH_DEBOUNCE_MS = 1000
+
+  async function reloadFromDisk() {
+    const viewport = { panX: state.panX, panY: state.panY, zoom: state.zoom }
+    const pageId = state.currentPageId
+
+    if (filePath && IS_TAURI) {
+      const { readFile: tauriRead } = await import('@tauri-apps/plugin-fs')
+      const bytes = await tauriRead(filePath)
+      const blob = new Blob([bytes])
+      const file = new File([blob], state.documentName + '.fig')
+      const imported = await readFigFile(file)
+      graph = imported
+      computeAllLayouts(graph)
+    } else if (fileHandle) {
+      const file = await fileHandle.getFile()
+      const imported = await readFigFile(file)
+      graph = imported
+      computeAllLayouts(graph)
+    } else {
+      return
+    }
+
+    undo.clear()
+    savedVersion = state.sceneVersion
+    state.selectedIds = new Set()
+    if (graph.getNode(pageId)) {
+      state.currentPageId = pageId
+    } else {
+      state.currentPageId = graph.getPages()[0]?.id ?? graph.rootId
+    }
+    state.panX = viewport.panX
+    state.panY = viewport.panY
+    state.zoom = viewport.zoom
+    requestRender()
+  }
+
+  function stopWatchingFile() {
+    if (unwatchFile) {
+      unwatchFile()
+      unwatchFile = null
+    }
+  }
+
+  async function startWatchingFile() {
+    stopWatchingFile()
+
+    if (filePath && IS_TAURI) {
+      const { watch: tauriWatch } = await import('@tauri-apps/plugin-fs')
+      const path = filePath
+      const unwatch = await tauriWatch(
+        path,
+        (event) => {
+          if (typeof event.type !== 'object' || !('modify' in event.type)) return
+          if (Date.now() - lastWriteTime < WATCH_DEBOUNCE_MS) return
+          reloadFromDisk()
+        },
+        { delayMs: 500 }
+      )
+      unwatchFile = () => unwatch()
+    } else if (fileHandle) {
+      let lastModified = (await fileHandle.getFile()).lastModified
+      const interval = setInterval(async () => {
+        if (!fileHandle) {
+          clearInterval(interval)
+          return
+        }
+        try {
+          const file = await fileHandle.getFile()
+          if (file.lastModified > lastModified) {
+            lastModified = file.lastModified
+            if (Date.now() - lastWriteTime < WATCH_DEBOUNCE_MS) return
+            reloadFromDisk()
+          }
+        } catch {
+          clearInterval(interval)
+        }
+      }, 2000)
+      unwatchFile = () => clearInterval(interval)
     }
   }
 
@@ -776,6 +871,7 @@ export function createEditorStore() {
     if ('vectorNetwork' in changes) {
       _renderer?.invalidateVectorPath(id)
     }
+    _renderer?.invalidateNodePicture(id)
     runLayoutForNode(id)
     syncIfInsideComponent(id)
     requestRender()
@@ -1446,7 +1542,9 @@ export function createEditorStore() {
       },
       inverse: () => {
         graph.deleteNode(id)
-        state.selectedIds.delete(id)
+        const next = new Set(state.selectedIds)
+        next.delete(id)
+        state.selectedIds = next
         requestRender()
       }
     })
@@ -1842,7 +1940,10 @@ export function createEditorStore() {
   }
 
   function applyZoom(delta: number, centerX: number, centerY: number) {
-    const factor = Math.pow(ZOOM_SENSITIVITY, delta)
+    const factor = Math.min(
+      ZOOM_SCALE_MAX,
+      Math.max(ZOOM_SCALE_MIN, Math.exp(-delta / ZOOM_DIVISOR))
+    )
     const newZoom = Math.max(0.02, Math.min(256, state.zoom * factor))
     state.panX = centerX - (centerX - state.panX) * (newZoom / state.zoom)
     state.panY = centerY - (centerY - state.panY) * (newZoom / state.zoom)

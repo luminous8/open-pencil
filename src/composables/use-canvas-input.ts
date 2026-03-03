@@ -919,18 +919,61 @@ export function useCanvasInput(
     cursorOverride.value = null
   }
 
+  let wheelAccum = {
+    deltaX: 0,
+    deltaY: 0,
+    zoomDelta: 0,
+    zoomCenterX: 0,
+    zoomCenterY: 0,
+    hasZoom: false,
+    rafId: 0
+  }
+
+  function flushWheel() {
+    wheelAccum.rafId = 0
+    if (wheelAccum.hasZoom) {
+      store.applyZoom(wheelAccum.zoomDelta, wheelAccum.zoomCenterX, wheelAccum.zoomCenterY)
+    } else {
+      store.pan(wheelAccum.deltaX, wheelAccum.deltaY)
+    }
+    wheelAccum.deltaX = 0
+    wheelAccum.deltaY = 0
+    wheelAccum.zoomDelta = 0
+    wheelAccum.hasZoom = false
+  }
+
+  // Normalize wheel deltaY across deltaMode variants (line/page/pixel).
+  // Trackpad pinch is always DOM_DELTA_PIXEL; external mice may use LINE or PAGE.
+  function normalizeWheelDelta(e: WheelEvent): { dx: number; dy: number } {
+    let { deltaX, deltaY } = e
+    if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      deltaX *= 40
+      deltaY *= 40
+    } else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      deltaX *= 800
+      deltaY *= 800
+    }
+    return { dx: deltaX, dy: deltaY }
+  }
+
   function onWheel(e: WheelEvent) {
     e.preventDefault()
     const canvas = canvasRef.value
     if (!canvas) return
+    const { dx, dy } = normalizeWheelDelta(e)
 
     if (e.ctrlKey || e.metaKey) {
       const rect = canvas.getBoundingClientRect()
-      const sx = e.clientX - rect.left
-      const sy = e.clientY - rect.top
-      store.applyZoom(e.deltaY, sx, sy)
+      wheelAccum.zoomCenterX = e.clientX - rect.left
+      wheelAccum.zoomCenterY = e.clientY - rect.top
+      wheelAccum.zoomDelta += dy
+      wheelAccum.hasZoom = true
     } else {
-      store.pan(-e.deltaX, -e.deltaY)
+      wheelAccum.deltaX -= dx
+      wheelAccum.deltaY -= dy
+    }
+    if (!wheelAccum.rafId) {
+      wheelAccum.rafId = requestAnimationFrame(flushWheel)
     }
   }
 
@@ -1161,6 +1204,22 @@ export function useCanvasInput(
 
   // Safari macOS: trackpad pinch-to-zoom uses gesture events, not wheel+ctrlKey
   let gestureStartZoom = 1
+  let gestureRafId = 0
+  let pendingGesture: { scale: number; sx: number; sy: number } | null = null
+
+  function flushGesture() {
+    gestureRafId = 0
+    if (!pendingGesture) return
+    const { scale, sx, sy } = pendingGesture
+    pendingGesture = null
+    const newZoom = Math.max(0.02, Math.min(256, gestureStartZoom * scale))
+    const zoomRatio = newZoom / store.state.zoom
+    store.state.panX = sx - (sx - store.state.panX) * zoomRatio
+    store.state.panY = sy - (sy - store.state.panY) * zoomRatio
+    store.state.zoom = newZoom
+    store.requestRepaint()
+  }
+
   useEventListener(
     canvasRef,
     'gesturestart' as keyof HTMLElementEventMap,
@@ -1179,14 +1238,14 @@ export function useCanvasInput(
       const canvas = canvasRef.value
       if (!canvas) return
       const rect = canvas.getBoundingClientRect()
-      const sx = (ge.clientX ?? rect.width / 2) - rect.left
-      const sy = (ge.clientY ?? rect.height / 2) - rect.top
-      const newZoom = Math.max(0.02, Math.min(256, gestureStartZoom * ge.scale))
-      const zoomRatio = newZoom / store.state.zoom
-      store.state.panX = sx - (sx - store.state.panX) * zoomRatio
-      store.state.panY = sy - (sy - store.state.panY) * zoomRatio
-      store.state.zoom = newZoom
-      store.requestRepaint()
+      pendingGesture = {
+        scale: ge.scale,
+        sx: (ge.clientX ?? rect.width / 2) - rect.left,
+        sy: (ge.clientY ?? rect.height / 2) - rect.top
+      }
+      if (!gestureRafId) {
+        gestureRafId = requestAnimationFrame(flushGesture)
+      }
     },
     { passive: false }
   )

@@ -57,8 +57,8 @@ import {
   TEXT_CARET_COLOR,
   TEXT_CARET_WIDTH
 } from './constants'
-import { vectorNetworkToPath } from './vector'
 import { isFontLoaded } from './fonts'
+import { vectorNetworkToPath } from './vector'
 
 import type { SceneNode, SceneGraph, Fill, Stroke } from './scene-graph'
 import type { SnapGuide } from './snap'
@@ -75,7 +75,9 @@ import type {
   FontMgr,
   FontWeight,
   TypefaceFontProvider,
-  SkPicture
+  SkPicture,
+  ImageFilter,
+  MaskFilter
 } from 'canvaskit-wasm'
 
 export interface RenderOverlays {
@@ -125,6 +127,11 @@ export class SkiaRenderer {
   private auxFill: Paint
   private auxStroke: Paint
   private opacityPaint: Paint
+  private effectLayerPaint: Paint
+  private imageFilterCache = new Map<string, ImageFilter>()
+  private maskFilterCache = new Map<number, MaskFilter>()
+  private _tmpColor = new Float32Array(4)
+  private _tmpRect = new Float32Array(4)
   private textFont: Font | null = null
   private labelFont: Font | null = null
   private sizeFont: Font | null = null
@@ -138,6 +145,7 @@ export class SkiaRenderer {
   private scenePicture: SkPicture | null = null
   private scenePictureVersion = -1
   private scenePicturePageId: string | null = null
+  private nodePictureCache = new Map<string, SkPicture>()
 
   private rulerBgPaint: Paint
   private rulerTickPaint: Paint
@@ -161,6 +169,24 @@ export class SkiaRenderer {
   pageId: string | null = null
 
   private worldViewport = { x: 0, y: 0, w: 0, h: 0 }
+
+  private color4f(r: number, g: number, b: number, a: number): Float32Array {
+    const c = this._tmpColor
+    c[0] = r
+    c[1] = g
+    c[2] = b
+    c[3] = a
+    return c
+  }
+
+  private ltrb(l: number, t: number, r: number, b: number): Float32Array {
+    const rc = this._tmpRect
+    rc[0] = l
+    rc[1] = t
+    rc[2] = r
+    rc[3] = b
+    return rc
+  }
 
   private selColor(alpha = 1) {
     return this.ck.Color4f(SELECTION_COLOR.r, SELECTION_COLOR.g, SELECTION_COLOR.b, alpha)
@@ -216,6 +242,7 @@ export class SkiaRenderer {
     this.auxStroke.setAntiAlias(true)
 
     this.opacityPaint = new ck.Paint()
+    this.effectLayerPaint = new ck.Paint()
 
     this.textFont = new ck.Font(null, DEFAULT_FONT_SIZE)
 
@@ -298,6 +325,12 @@ export class SkiaRenderer {
     }
 
     this.fontsLoaded = true
+    this.invalidateAllPictures()
+  }
+
+  replaceSurface(surface: Surface): void {
+    this.surface.delete()
+    this.surface = surface
     this.invalidateScenePicture()
   }
 
@@ -305,6 +338,20 @@ export class SkiaRenderer {
     this.scenePicture?.delete()
     this.scenePicture = null
     this.scenePictureVersion = -1
+  }
+
+  invalidateAllPictures(): void {
+    this.invalidateScenePicture()
+    for (const pic of this.nodePictureCache.values()) pic.delete()
+    this.nodePictureCache.clear()
+  }
+
+  invalidateNodePicture(nodeId: string): void {
+    const pic = this.nodePictureCache.get(nodeId)
+    if (pic) {
+      pic.delete()
+      this.nodePictureCache.delete(nodeId)
+    }
   }
 
   hitTestSectionTitle(graph: SceneGraph, canvasX: number, canvasY: number): SceneNode | null {
@@ -373,7 +420,7 @@ export class SkiaRenderer {
     if (!pageNode) return null
 
     const font = this.componentLabelFont
-    const LABEL_TYPES = new Set(['COMPONENT', 'COMPONENT_SET', 'INSTANCE'])
+    const LABEL_TYPES = new Set(['COMPONENT', 'COMPONENT_SET'])
     let result: SceneNode | null = null
 
     const check = (parentId: string, ox: number, oy: number) => {
@@ -443,6 +490,8 @@ export class SkiaRenderer {
     overlays: RenderOverlays = {},
     sceneVersion = -1
   ): void {
+    graph.clearAbsPosCache()
+
     const canvas = this.surface.getCanvas()
     canvas.clear(this.ck.Color4f(this.pageColor.r, this.pageColor.g, this.pageColor.b, 1))
 
@@ -959,6 +1008,12 @@ export class SkiaRenderer {
       canvas.saveLayer(this.opacityPaint)
     }
 
+    const layerBlur = node.effects.find((e) => e.visible && e.type === 'LAYER_BLUR')
+    if (layerBlur) {
+      this.effectLayerPaint.setImageFilter(this.getCachedBlur(layerBlur.radius / 2))
+      canvas.saveLayer(this.effectLayerPaint)
+    }
+
     const rotation =
       overlays.rotationPreview?.nodeId === nodeId ? overlays.rotationPreview.angle : node.rotation
 
@@ -1013,6 +1068,9 @@ export class SkiaRenderer {
       }
     }
 
+    if (layerBlur) {
+      canvas.restore()
+    }
     if (node.opacity < 1) {
       canvas.restore()
     }
@@ -1223,7 +1281,7 @@ export class SkiaRenderer {
     if (!pageNode) return
 
     const font = this.componentLabelFont
-    const LABEL_TYPES = new Set(['COMPONENT', 'COMPONENT_SET', 'INSTANCE'])
+    const LABEL_TYPES = new Set(['COMPONENT', 'COMPONENT_SET'])
 
     const nodes: { node: SceneNode; absX: number; absY: number; inside: boolean }[] = []
     const collect = (parentId: string, ox: number, oy: number) => {
@@ -1347,6 +1405,43 @@ export class SkiaRenderer {
   }
 
   private renderShape(canvas: Canvas, node: SceneNode, graph: SceneGraph): void {
+    const hasEffects = node.effects.length > 0 && node.effects.some((e) => e.visible)
+
+    if (hasEffects) {
+      const cached = this.nodePictureCache.get(node.id)
+      if (cached) {
+        canvas.drawPicture(cached)
+        return
+      }
+
+      const margin = this.effectOverflow(node)
+      const bounds = this.ck.LTRBRect(-margin, -margin, node.width + margin, node.height + margin)
+      const recorder = new this.ck.PictureRecorder()
+      const recCanvas = recorder.beginRecording(bounds)
+      this.renderShapeUncached(recCanvas, node, graph)
+      const picture = recorder.finishRecordingAsPicture()
+      recorder.delete()
+      this.nodePictureCache.set(node.id, picture)
+      canvas.drawPicture(picture)
+    } else {
+      this.renderShapeUncached(canvas, node, graph)
+    }
+  }
+
+  private effectOverflow(node: SceneNode): number {
+    let expand = 0
+    for (const e of node.effects) {
+      if (!e.visible) continue
+      const blur = e.radius
+      const spread = e.spread
+      const ox = Math.abs(e.offset.x)
+      const oy = Math.abs(e.offset.y)
+      expand = Math.max(expand, blur + spread + ox, blur + spread + oy)
+    }
+    return expand
+  }
+
+  private renderShapeUncached(canvas: Canvas, node: SceneNode, graph: SceneGraph): void {
     const rect = this.ck.LTRBRect(0, 0, node.width, node.height)
 
     const hasRadius =
@@ -1356,6 +1451,9 @@ export class SkiaRenderer {
           node.topRightRadius > 0 ||
           node.bottomRightRadius > 0 ||
           node.bottomLeftRadius > 0))
+
+    // Effects (behind: drop shadow)
+    this.renderEffects(canvas, node, rect, hasRadius, 'behind')
 
     // Fills
     for (let fi = 0; fi < node.fills.length; fi++) {
@@ -1367,9 +1465,6 @@ export class SkiaRenderer {
       this.drawNodeFill(canvas, node, rect, hasRadius)
       this.fillPaint.setShader(null)
     }
-
-    // Effects (behind: drop shadow)
-    this.renderEffects(canvas, node, rect, hasRadius, 'behind')
 
     // Strokes
     for (let si = 0; si < node.strokes.length; si++) {
@@ -1534,6 +1629,127 @@ export class SkiaRenderer {
     )
   }
 
+  private getCachedDropShadow(
+    dx: number,
+    dy: number,
+    sigma: number,
+    color: Float32Array
+  ): ImageFilter {
+    const key = `ds:${dx},${dy},${sigma},${color[0]},${color[1]},${color[2]},${color[3]}`
+    let filter = this.imageFilterCache.get(key)
+    if (!filter) {
+      filter = this.ck.ImageFilter.MakeDropShadowOnly(dx, dy, sigma, sigma, color, null)
+      this.imageFilterCache.set(key, filter)
+    }
+    return filter
+  }
+
+  private getCachedBlur(sigma: number): ImageFilter {
+    const key = `blur:${sigma}`
+    let filter = this.imageFilterCache.get(key)
+    if (!filter) {
+      filter = this.ck.ImageFilter.MakeBlur(sigma, sigma, this.ck.TileMode.Clamp, null)
+      this.imageFilterCache.set(key, filter)
+    }
+    return filter
+  }
+
+  private getCachedDecalBlur(sigma: number): ImageFilter {
+    const key = `dblur:${sigma}`
+    let filter = this.imageFilterCache.get(key)
+    if (!filter) {
+      filter = this.ck.ImageFilter.MakeBlur(sigma, sigma, this.ck.TileMode.Decal, null)
+      this.imageFilterCache.set(key, filter)
+    }
+    return filter
+  }
+
+  private getCachedMaskBlur(sigma: number): MaskFilter {
+    let filter = this.maskFilterCache.get(sigma)
+    if (!filter) {
+      filter = this.ck.MaskFilter.MakeBlur(this.ck.BlurStyle.Normal, sigma, true)
+      this.maskFilterCache.set(sigma, filter)
+    }
+    return filter
+  }
+
+  private applyClippedBlur(
+    canvas: Canvas,
+    node: SceneNode,
+    rect: Float32Array,
+    hasRadius: boolean,
+    sigma: number
+  ): void {
+    canvas.save()
+    this.clipNodeShape(canvas, node, rect, hasRadius)
+    this.effectLayerPaint.setImageFilter(this.getCachedBlur(sigma))
+    canvas.saveLayer(this.effectLayerPaint)
+    canvas.restore()
+    canvas.restore()
+  }
+
+  private clipNodeShape(canvas: Canvas, node: SceneNode, rect: Float32Array, hasRadius: boolean): void {
+    if (node.type === 'ELLIPSE') {
+      const clipPath = new this.ck.Path()
+      clipPath.addOval(rect)
+      canvas.clipPath(clipPath, this.ck.ClipOp.Intersect, true)
+      clipPath.delete()
+    } else if (hasRadius) {
+      canvas.clipRRect(this.makeRRect(node), this.ck.ClipOp.Intersect, true)
+    } else {
+      canvas.clipRect(rect, this.ck.ClipOp.Intersect, true)
+    }
+  }
+
+  private makeRRectWithSpread(node: SceneNode, spread: number): Float32Array {
+    if (node.independentCorners) {
+      return new Float32Array([
+        -spread,
+        -spread,
+        node.width + spread,
+        node.height + spread,
+        Math.max(0, node.topLeftRadius + spread),
+        Math.max(0, node.topLeftRadius + spread),
+        Math.max(0, node.topRightRadius + spread),
+        Math.max(0, node.topRightRadius + spread),
+        Math.max(0, node.bottomRightRadius + spread),
+        Math.max(0, node.bottomRightRadius + spread),
+        Math.max(0, node.bottomLeftRadius + spread),
+        Math.max(0, node.bottomLeftRadius + spread)
+      ])
+    }
+    return this.ck.RRectXY(
+      this.ck.LTRBRect(-spread, -spread, node.width + spread, node.height + spread),
+      Math.max(0, node.cornerRadius + spread),
+      Math.max(0, node.cornerRadius + spread)
+    )
+  }
+
+  private makeRRectWithOffset(node: SceneNode, ox: number, oy: number, spread: number): Float32Array {
+    const s = spread
+    if (node.independentCorners) {
+      return new Float32Array([
+        ox + s,
+        oy + s,
+        node.width + ox - s,
+        node.height + oy - s,
+        Math.max(0, node.topLeftRadius - s),
+        Math.max(0, node.topLeftRadius - s),
+        Math.max(0, node.topRightRadius - s),
+        Math.max(0, node.topRightRadius - s),
+        Math.max(0, node.bottomRightRadius - s),
+        Math.max(0, node.bottomRightRadius - s),
+        Math.max(0, node.bottomLeftRadius - s),
+        Math.max(0, node.bottomLeftRadius - s)
+      ])
+    }
+    return this.ck.RRectXY(
+      this.ck.LTRBRect(ox + s, oy + s, node.width + ox - s, node.height + oy - s),
+      Math.max(0, node.cornerRadius - s),
+      Math.max(0, node.cornerRadius - s)
+    )
+  }
+
   private drawArc(canvas: Canvas, node: SceneNode, paint: Paint): void {
     const arc = node.arcData
     if (!arc) return
@@ -1586,38 +1802,76 @@ export class SkiaRenderer {
       if (!effect.visible) continue
 
       if (pass === 'behind' && effect.type === 'DROP_SHADOW') {
-        this.auxFill.setColor(
-          this.ck.Color4f(effect.color.r, effect.color.g, effect.color.b, effect.color.a)
-        )
-        this.auxFill.setImageFilter(
-          this.ck.ImageFilter.MakeBlur(effect.radius, effect.radius, this.ck.TileMode.Decal, null)
-        )
+        const sp = effect.spread
+        const sigma = effect.radius / 2
 
-        canvas.save()
-        canvas.translate(effect.offset.x, effect.offset.y)
-        if (node.type === 'ELLIPSE') {
-          canvas.drawOval(rect, this.auxFill)
-        } else if (hasRadius) {
-          canvas.drawRRect(this.makeRRect(node), this.auxFill)
+        if (node.type === 'TEXT') {
+          const shadowColor = this.ck.Color4f(
+            effect.color.r,
+            effect.color.g,
+            effect.color.b,
+            effect.color.a
+          )
+          const dropFilter = this.getCachedDropShadow(
+            effect.offset.x,
+            effect.offset.y,
+            sigma,
+            shadowColor
+          )
+          this.effectLayerPaint.setImageFilter(dropFilter)
+          canvas.saveLayer(this.effectLayerPaint)
+          this.renderText(canvas, node)
+          canvas.restore()
         } else {
-          canvas.drawRect(rect, this.auxFill)
+          this.auxFill.setColor(
+            this.color4f(effect.color.r, effect.color.g, effect.color.b, effect.color.a)
+          )
+          this.auxFill.setMaskFilter(this.getCachedMaskBlur(sigma))
+          this.auxFill.setImageFilter(null)
+          canvas.save()
+          canvas.translate(effect.offset.x, effect.offset.y)
+          if (node.type === 'ELLIPSE') {
+            canvas.drawOval(this.ltrb(-sp, -sp, node.width + sp, node.height + sp), this.auxFill)
+          } else if (hasRadius) {
+            canvas.drawRRect(this.makeRRectWithSpread(node, sp), this.auxFill)
+          } else {
+            canvas.drawRect(this.ltrb(-sp, -sp, node.width + sp, node.height + sp), this.auxFill)
+          }
+          canvas.restore()
+          this.auxFill.setMaskFilter(null)
         }
-        canvas.restore()
-        this.auxFill.setImageFilter(null)
       }
 
-      if (pass === 'front' && effect.type === 'LAYER_BLUR') {
-        // Layer blur applied as save layer with blur filter — already applied via opacity layer
+      if (
+        (pass === 'behind' && effect.type === 'BACKGROUND_BLUR') ||
+        (pass === 'front' && effect.type === 'FOREGROUND_BLUR')
+      ) {
+        this.applyClippedBlur(canvas, node, rect, hasRadius, effect.radius / 2)
       }
 
       if (pass === 'front' && effect.type === 'INNER_SHADOW') {
-        // Inner shadow: draw a shadow clipped to the node shape
+        if (node.type === 'TEXT') {
+          this.effectLayerPaint.setImageFilter(this.getCachedDecalBlur(effect.radius))
+          this.effectLayerPaint.setColorFilter(
+            this.ck.ColorFilter.MakeBlend(
+              this.ck.Color4f(effect.color.r, effect.color.g, effect.color.b, effect.color.a),
+              this.ck.BlendMode.SrcIn
+            )
+          )
+          canvas.saveLayer(this.effectLayerPaint)
+          canvas.save()
+          canvas.translate(effect.offset.x, effect.offset.y)
+          this.renderText(canvas, node)
+          canvas.restore()
+          canvas.restore()
+          this.effectLayerPaint.setColorFilter(null)
+          continue
+        }
+        const sp = effect.spread
         this.auxFill.setColor(
           this.ck.Color4f(effect.color.r, effect.color.g, effect.color.b, effect.color.a)
         )
-        this.auxFill.setImageFilter(
-          this.ck.ImageFilter.MakeBlur(effect.radius, effect.radius, this.ck.TileMode.Decal, null)
-        )
+        this.auxFill.setImageFilter(this.getCachedDecalBlur(effect.radius))
 
         canvas.save()
         if (node.type === 'ELLIPSE') {
@@ -1631,34 +1885,39 @@ export class SkiaRenderer {
           canvas.clipRect(rect, this.ck.ClipOp.Intersect, true)
         }
 
-        // Draw inverted shape offset by shadow offset
+        const expand = effect.radius * 2
         const big = this.ck.LTRBRect(
-          -effect.radius * 2 + effect.offset.x,
-          -effect.radius * 2 + effect.offset.y,
-          node.width + effect.radius * 2 + effect.offset.x,
-          node.height + effect.radius * 2 + effect.offset.y
+          -expand + effect.offset.x,
+          -expand + effect.offset.y,
+          node.width + expand + effect.offset.x,
+          node.height + expand + effect.offset.y
         )
         const bigPath = new this.ck.Path()
         bigPath.addRect(big)
         if (node.type === 'ELLIPSE') {
           const innerPath = new this.ck.Path()
           const offsetRect = this.ck.LTRBRect(
-            effect.offset.x,
-            effect.offset.y,
-            node.width + effect.offset.x,
-            node.height + effect.offset.y
+            effect.offset.x + sp,
+            effect.offset.y + sp,
+            node.width + effect.offset.x - sp,
+            node.height + effect.offset.y - sp
           )
           innerPath.addOval(offsetRect)
+          bigPath.op(innerPath, this.ck.PathOp.Difference)
+          innerPath.delete()
+        } else if (hasRadius) {
+          const innerPath = new this.ck.Path()
+          innerPath.addRRect(this.makeRRectWithOffset(node, effect.offset.x + sp, effect.offset.y + sp, -sp))
           bigPath.op(innerPath, this.ck.PathOp.Difference)
           innerPath.delete()
         } else {
           const innerPath = new this.ck.Path()
           innerPath.addRect(
             this.ck.LTRBRect(
-              effect.offset.x,
-              effect.offset.y,
-              node.width + effect.offset.x,
-              node.height + effect.offset.y
+              effect.offset.x + sp,
+              effect.offset.y + sp,
+              node.width + effect.offset.x - sp,
+              node.height + effect.offset.y - sp
             )
           )
           bigPath.op(innerPath, this.ck.PathOp.Difference)
@@ -2465,6 +2724,13 @@ export class SkiaRenderer {
     this.penHandlePaint.delete()
     this.penVertexFill.delete()
     this.penVertexStroke.delete()
+    this.effectLayerPaint.delete()
+    for (const filter of this.imageFilterCache.values()) filter.delete()
+    this.imageFilterCache.clear()
+    for (const filter of this.maskFilterCache.values()) filter.delete()
+    this.maskFilterCache.clear()
+    for (const pic of this.nodePictureCache.values()) pic.delete()
+    this.nodePictureCache.clear()
     this.scenePicture?.delete()
     this.surface.delete()
   }

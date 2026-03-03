@@ -266,6 +266,8 @@ export interface SceneNode {
 
   boundVariables: Record<string, string>
 
+  internalOnly: boolean
+
   textPicture: Uint8Array | null
 }
 
@@ -387,6 +389,7 @@ function createDefaultNode(type: NodeType, overrides: Partial<SceneNode> = {}): 
     componentId: null,
     overrides: {},
     boundVariables: {},
+    internalOnly: false,
     textPicture: null,
     ...overrides
   }
@@ -409,6 +412,7 @@ export class SceneGraph {
   variableCollections = new Map<string, VariableCollection>()
   activeMode = new Map<string, string>()
   rootId: string
+  private absPosCache = new Map<string, { x: number; y: number }>()
 
   constructor() {
     const root = createDefaultNode('FRAME', {
@@ -426,8 +430,10 @@ export class SceneGraph {
     return this.createNode('CANVAS', this.rootId, { name, width: 0, height: 0 })
   }
 
-  getPages(): SceneNode[] {
-    return this.getChildren(this.rootId).filter((n) => n.type === 'CANVAS')
+  getPages(includeInternal = false): SceneNode[] {
+    return this.getChildren(this.rootId).filter(
+      (n) => n.type === 'CANVAS' && (includeInternal || !n.internalOnly)
+    )
   }
 
   getAllNodes(): Iterable<SceneNode> {
@@ -609,7 +615,14 @@ export class SceneGraph {
     return false
   }
 
+  clearAbsPosCache(): void {
+    this.absPosCache.clear()
+  }
+
   getAbsolutePosition(id: string): { x: number; y: number } {
+    const cached = this.absPosCache.get(id)
+    if (cached) return cached
+
     let ax = 0
     let ay = 0
     let current = this.nodes.get(id)
@@ -618,7 +631,9 @@ export class SceneGraph {
       ay += current.y
       current = current.parentId ? this.nodes.get(current.parentId) : undefined
     }
-    return { x: ax, y: ay }
+    const result = { x: ax, y: ay }
+    this.absPosCache.set(id, result)
+    return result
   }
 
   getAbsoluteBounds(id: string): Rect {
@@ -648,6 +663,7 @@ export class SceneGraph {
   updateNode(id: string, changes: Partial<SceneNode>): void {
     const node = this.nodes.get(id)
     if (!node) return
+    this.absPosCache.clear()
     Object.assign(node, changes)
   }
 
@@ -660,6 +676,8 @@ export class SceneGraph {
     const newParent = this.nodes.get(newParentId)
     if (!newParent) return
     if (node.parentId === newParentId) return
+
+    this.absPosCache.clear()
 
     // Convert absolute position
     const absPos = this.getAbsolutePosition(nodeId)

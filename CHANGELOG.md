@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-03-03
 
 ### Features
 
+- Effects rendering: drop shadow, inner shadow, shadow spread, layer blur, background blur, foreground blur
+- Text shadows render on glyphs instead of bounding box
 - Multi-file tabs — open multiple documents in tabs within a single window
 - Tab bar with close buttons, middle-click to close, and new tab (+) button
 - Keyboard shortcuts: ⌘N/⌘T new tab, ⌘W close tab, ⌘O opens in new tab
@@ -27,30 +29,55 @@
 
 ### UI
 
+- Resizable pages/layers split in left panel with reka-ui Splitter
+- Layers tree auto-expands and scrolls to reveal selected node
+- Loading overlay on canvas while opening .fig files
+- Hide internal-only pages (e.g. "Internal Only Canvas" in design systems)
+- Render page dividers — pages named with only dashes/asterisks/spaces show as horizontal lines
+- Only show component labels for COMPONENT and COMPONENT_SET, not instances
 - Replace all native `<select>` dropdowns with reka-ui `AppSelect` component
+- Smoother trackpad pinch-to-zoom with `Math.exp` curve and deltaMode normalization
 - Fix font picker dropdown truncating long font names
 - Show explanation in font picker when Local Font Access API unavailable (Safari/Firefox)
 
 ### Fixes
 
+- Fix drop shadow rendering on top of fills — shadow now draws behind opaque content
+- Fix effect property changes not recorded in undo/redo history
+- Fix active tab text invisible against same-color background
 - Fix clipboard "Outside int range" error — `pasteID` used unsigned int exceeding Kiwi's signed 32-bit field
 - Error toasts are now sticky (don't auto-dismiss), with selectable text, copy button, and close button
 - Truncate long node names in export button
+
+### Performance
+
+- Per-node SkPicture cache for effect rendering — unchanged shadow/blur nodes replay from cache on scene redraws
+- Drop shadows use `MaskFilter` direct draw instead of `saveLayer` offscreen buffers
+- Cached `ImageFilter`, `MaskFilter`, reusable effect paint — zero per-frame WASM allocations for effects
+- Reuse GL context on panel resize — swap surface without recreating renderer, preserving all caches
+- Per-frame absolute position cache — avoids repeated parent-chain walks during rendering
+- Optimize zoom/pan smoothness with `shallowReactive`, `useRafFn`, and input coalescing
 
 ### Build
 
 - Auto-populate GitHub Release notes from CHANGELOG.md via `ffurrer2/extract-release-notes@v2`
 - Skip already-published npm versions on CI re-runs instead of failing
+- Exclude non-app directories from Vite file watcher
 
 ### Internal
 
 - Extract shared color constants (`BLACK`, `TRANSPARENT`, `DEFAULT_SHADOW_COLOR`) — replaces 8 inline literals across core
 - Extract shared `NodeContextMenuContent` component to avoid menu duplication
 - Fix `@open-pencil/core` dep in MCP package: `workspace:*` for local dev (pnpm resolves at publish time)
+- Replace store thunks with a late-binding proxy
 
 ### Tests
 
 - Clipboard roundtrip tests: encode to Figma Kiwi binary → decode → verify
+- 9 visual regression snapshot tests for effects rendering
+- Zoom/pan E2E tests and pipeline benchmark
+- MCP server edge-case tests for `find_nodes` and Zod validation
+- 6 unit tests for absolute position cache
 
 ## [0.4.2] (2026-03-02)
 
