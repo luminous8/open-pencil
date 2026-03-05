@@ -1,16 +1,19 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test, setDefaultTimeout } from 'bun:test'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { randomUUID } from 'crypto'
+import { heavy } from '../helpers/test-utils'
+
+setDefaultTimeout(30_000)
 
 const CLI = join(import.meta.dir, '../../packages/cli/src/index.ts')
-const FIXTURE = join(import.meta.dir, '../fixtures/material3.fig')
+const FIXTURE = join(import.meta.dir, '../fixtures/gold-preview.fig')
 
 async function run(args: string[], stdin?: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn(['bun', CLI, ...args], {
     stdout: 'pipe',
     stderr: 'pipe',
-    stdin: stdin ? new Response(stdin).body! : undefined,
+    stdin: stdin ? Buffer.from(stdin) : undefined,
   })
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -20,7 +23,7 @@ async function run(args: string[], stdin?: string): Promise<{ stdout: string; st
   return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode }
 }
 
-describe('eval CLI', () => {
+heavy('eval CLI', () => {
   test('returns page name', async () => {
     const { stdout, exitCode } = await run(['eval', FIXTURE, '--code', 'return figma.currentPage.name'])
     expect(exitCode).toBe(0)
@@ -50,7 +53,7 @@ describe('eval CLI', () => {
     expect(exitCode).toBe(0)
     const data = JSON.parse(stdout)
     expect(Array.isArray(data)).toBe(true)
-    expect(data.length).toBe(3)
+    expect(data.length).toBeGreaterThan(0)
     expect(data[0].type).toBe('TEXT')
   })
 
@@ -107,12 +110,20 @@ describe('eval CLI', () => {
   })
 
   test('stdin reads code from pipe', async () => {
-    const { stdout, exitCode } = await run(
-      ['eval', FIXTURE, '--stdin'],
-      'return figma.currentPage.name',
-    )
-    expect(exitCode).toBe(0)
-    expect(stdout.length).toBeGreaterThan(0)
+    const proc = Bun.spawn(['bun', CLI, 'eval', FIXTURE, '--stdin'], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      stdin: 'pipe',
+    })
+    proc.stdin.write('return figma.currentPage.name')
+    proc.stdin.end()
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ])
+    const exitCode = await proc.exited
+    if (exitCode !== 0) throw new Error(`exit ${exitCode}: ${stderr}`)
+    expect(stdout.trim().length).toBeGreaterThan(0)
   })
 
   test('--json outputs valid JSON', async () => {

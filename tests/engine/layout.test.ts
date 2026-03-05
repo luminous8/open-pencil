@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 
 import { SceneGraph, type SceneNode } from '../../src/engine/scene-graph'
-import { computeLayout, computeAllLayouts } from '../../src/engine/layout'
+import { computeLayout, computeAllLayouts, setTextMeasurer } from '../../src/engine/layout'
 
 function pageId(graph: SceneGraph) {
   return graph.getPages()[0].id
@@ -469,6 +469,90 @@ describe('Auto Layout', () => {
     })
   })
 
+  describe('hidden children', () => {
+    test('hidden children collapse to zero size in auto layout', () => {
+      const graph = new SceneGraph()
+      const frame = autoFrame(graph, pageId(graph), {
+        width: 300,
+        height: 100,
+        itemSpacing: 10,
+      })
+      rect(graph, frame.id, 50, 50, { visible: false })
+      rect(graph, frame.id, 80, 40)
+      rect(graph, frame.id, 50, 50, { visible: false })
+
+      computeLayout(graph, frame.id)
+
+      const children = graph.getChildren(frame.id)
+      expect(children[0].width).toBe(0)
+      expect(children[0].height).toBe(0)
+      expect(children[1].x).toBe(0)
+      expect(children[1].width).toBe(80)
+      expect(children[2].width).toBe(0)
+      expect(children[2].height).toBe(0)
+    })
+
+    test('hidden children do not consume spacing', () => {
+      const graph = new SceneGraph()
+      const frame = autoFrame(graph, pageId(graph), {
+        width: 400,
+        height: 100,
+        itemSpacing: 20,
+      })
+      rect(graph, frame.id, 50, 50, { visible: false })
+      rect(graph, frame.id, 100, 50)
+      rect(graph, frame.id, 100, 50)
+
+      computeLayout(graph, frame.id)
+
+      const children = graph.getChildren(frame.id)
+      expect(children[1].x).toBe(0)
+      expect(children[2].x).toBe(120)
+    })
+
+    test('hug frame ignores hidden children for sizing', () => {
+      const graph = new SceneGraph()
+      const frame = autoFrame(graph, pageId(graph), {
+        primaryAxisSizing: 'HUG',
+        counterAxisSizing: 'HUG',
+      })
+      rect(graph, frame.id, 200, 200, { visible: false })
+      rect(graph, frame.id, 50, 30)
+
+      computeLayout(graph, frame.id)
+
+      const f = graph.getNode(frame.id)!
+      expect(f.width).toBe(50)
+      expect(f.height).toBe(30)
+    })
+
+    test('hidden nested auto-layout children collapse', () => {
+      const graph = new SceneGraph()
+      const outer = autoFrame(graph, pageId(graph), {
+        width: 300,
+        height: 100,
+        itemSpacing: 16,
+      })
+      const inner = autoFrame(graph, outer.id, {
+        primaryAxisSizing: 'FIXED',
+        counterAxisSizing: 'FIXED',
+        width: 50,
+        height: 50,
+        visible: false,
+      })
+      rect(graph, inner.id, 30, 30)
+      rect(graph, outer.id, 80, 40)
+
+      computeLayout(graph, outer.id)
+
+      const children = graph.getChildren(outer.id)
+      const innerNode = graph.getNode(inner.id)!
+      expect(innerNode.width).toBe(0)
+      expect(innerNode.height).toBe(0)
+      expect(children[1].x).toBe(0)
+    })
+  })
+
   describe('self-alignment', () => {
     test('layoutAlignSelf STRETCH overrides counter axis', () => {
       const graph = new SceneGraph()
@@ -883,6 +967,86 @@ describe('Auto Layout', () => {
       expect(children[2].y).toBe(0)
       expect(children[3].x).toBe(60)
       expect(children[3].y).toBe(90)
+    })
+  })
+
+  describe('text measurement', () => {
+    test('WIDTH_AND_HEIGHT text uses measured width in centered layout', () => {
+      const graph = new SceneGraph()
+      const pid = pageId(graph)
+
+      const frame = autoFrame(graph, pid, {
+        width: 300,
+        height: 40,
+        layoutMode: 'HORIZONTAL',
+        primaryAxisSizing: 'FIXED',
+        counterAxisSizing: 'FIXED',
+        primaryAxisAlign: 'CENTER',
+        paddingLeft: 10,
+        paddingRight: 10,
+        itemSpacing: 10,
+      })
+
+      const arrow1 = graph.createNode('FRAME', frame.id, { width: 20, height: 20 })
+      const text = graph.createNode('TEXT', frame.id, {
+        width: 200,
+        height: 20,
+        text: 'Test',
+        fontSize: 14,
+        textAutoResize: 'WIDTH_AND_HEIGHT' as const,
+      })
+      const arrow2 = graph.createNode('FRAME', frame.id, { width: 20, height: 20 })
+
+      setTextMeasurer((node) => {
+        if (node.type === 'TEXT' && node.textAutoResize === 'WIDTH_AND_HEIGHT') {
+          return { width: 60, height: 20 }
+        }
+        return null
+      })
+
+      computeAllLayouts(graph)
+
+      setTextMeasurer(null)
+
+      const updatedText = graph.getNode(text.id)!
+      const updatedArrow1 = graph.getNode(arrow1.id)!
+      const updatedArrow2 = graph.getNode(arrow2.id)!
+
+      expect(updatedText.width).toBe(60)
+
+      // Total content: 10 + 20 + 10 + 60 + 10 + 20 + 10 = 140
+      // Free space: 300 - 140 = 160, centered offset = 80
+      expect(updatedArrow1.x).toBe(90)
+      expect(updatedText.x).toBe(120)
+      expect(updatedArrow2.x).toBe(190)
+    })
+
+    test('without measurer, text keeps its existing width', () => {
+      const graph = new SceneGraph()
+      const pid = pageId(graph)
+
+      const frame = autoFrame(graph, pid, {
+        width: 300,
+        height: 40,
+        layoutMode: 'HORIZONTAL',
+        primaryAxisSizing: 'FIXED',
+        counterAxisSizing: 'FIXED',
+        primaryAxisAlign: 'CENTER',
+      })
+
+      const text = graph.createNode('TEXT', frame.id, {
+        width: 200,
+        height: 20,
+        text: 'Test',
+        fontSize: 14,
+        textAutoResize: 'WIDTH_AND_HEIGHT' as const,
+      })
+
+      setTextMeasurer(null)
+      computeAllLayouts(graph)
+
+      const updatedText = graph.getNode(text.id)!
+      expect(updatedText.width).toBe(200)
     })
   })
 })

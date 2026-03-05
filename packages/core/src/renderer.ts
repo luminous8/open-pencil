@@ -55,10 +55,12 @@ import {
   RULER_MAJOR_TOLERANCE,
   TEXT_SELECTION_COLOR,
   TEXT_CARET_COLOR,
-  TEXT_CARET_WIDTH
+  TEXT_CARET_WIDTH,
+  DEFAULT_FONT_FAMILY
 } from './constants'
-import { isFontLoaded } from './fonts'
-import { vectorNetworkToPath } from './vector'
+import { isFontLoaded, getCJKFallbackFamily } from './fonts'
+import { vectorNetworkToPath, geometryBlobToPath } from './vector'
+import { RenderProfiler } from './profiler'
 
 import type { SceneNode, SceneGraph, Fill, Stroke } from './scene-graph'
 import type { SnapGuide } from './snap'
@@ -141,11 +143,14 @@ export class SkiaRenderer {
   private fontProvider: TypefaceFontProvider | null = null
   private fontsLoaded = false
   private imageCache = new Map<string, CKImage>()
-  private vectorPathCache = new Map<string, Path>()
+  private vectorPathCache = new Map<string, Path[]>()
+  private fillGeometryCache = new Map<string, Path[]>()
+  private strokeGeometryCache = new Map<string, Path[]>()
   private scenePicture: SkPicture | null = null
   private scenePictureVersion = -1
   private scenePicturePageId: string | null = null
   private nodePictureCache = new Map<string, SkPicture>()
+  readonly profiler: RenderProfiler
 
   private rulerBgPaint: Paint
   private rulerTickPaint: Paint
@@ -169,6 +174,8 @@ export class SkiaRenderer {
   pageId: string | null = null
 
   private worldViewport = { x: 0, y: 0, w: 0, h: 0 }
+  private _nodeCount = 0
+  private _culledCount = 0
 
   private color4f(r: number, g: number, b: number, a: number): Float32Array {
     const c = this._tmpColor
@@ -200,9 +207,10 @@ export class SkiaRenderer {
     return type === 'COMPONENT' || type === 'COMPONENT_SET' || type === 'INSTANCE'
   }
 
-  constructor(ck: CanvasKit, surface: Surface) {
+  constructor(ck: CanvasKit, surface: Surface, gl?: WebGL2RenderingContext | null) {
     this.ck = ck
     this.surface = surface
+    this.profiler = new RenderProfiler(ck, gl ?? null)
 
     this.fillPaint = new ck.Paint()
     this.fillPaint.setStyle(ck.PaintStyle.Fill)
@@ -303,10 +311,10 @@ export class SkiaRenderer {
   async loadFonts(): Promise<void> {
     this.fontProvider = this.ck.TypefaceFontProvider.Make()
 
-    const { initFontService, loadFont } = await import('./fonts')
+    const { initFontService, loadFont, ensureCJKFallback } = await import('./fonts')
     initFontService(this.ck, this.fontProvider)
 
-    const fontData = await loadFont('Inter', 'Regular')
+    const fontData = await loadFont(DEFAULT_FONT_FAMILY, 'Regular')
     if (fontData) {
       const typeface = this.ck.Typeface.MakeFreeTypeFaceFromData(fontData)
       if (typeface) {
@@ -320,12 +328,17 @@ export class SkiaRenderer {
         this.sizeFont = new this.ck.Font(typeface, SIZE_FONT_SIZE)
         this.sectionTitleFont = new this.ck.Font(typeface, SECTION_TITLE_FONT_SIZE)
         this.componentLabelFont = new this.ck.Font(typeface, COMPONENT_LABEL_FONT_SIZE)
+        this.profiler.setTypeface(typeface)
       }
       this.fontMgr = this.ck.FontMgr.FromData(fontData) ?? null
     }
 
     this.fontsLoaded = true
     this.invalidateAllPictures()
+
+    ensureCJKFallback().then((family) => {
+      if (family) this.invalidateAllPictures()
+    })
   }
 
   replaceSurface(surface: Surface): void {
@@ -490,6 +503,9 @@ export class SkiaRenderer {
     overlays: RenderOverlays = {},
     sceneVersion = -1
   ): void {
+    const p = this.profiler
+    p.beginFrame()
+
     graph.clearAbsPosCache()
 
     const canvas = this.surface.getCanvas()
@@ -504,7 +520,6 @@ export class SkiaRenderer {
     }
 
     const hasVolatileOverlays =
-      overlays.hoveredNodeId != null ||
       overlays.dropTargetId != null ||
       overlays.rotationPreview != null ||
       overlays.editingTextId != null
@@ -515,48 +530,80 @@ export class SkiaRenderer {
       sceneVersion === this.scenePictureVersion &&
       this.pageId === this.scenePicturePageId
 
+    p.setCacheHit(!!canUsePicture)
+
     // Scene layer (world coordinates)
     canvas.save()
     canvas.scale(this.dpr, this.dpr)
     canvas.translate(this.panX, this.panY)
     canvas.scale(this.zoom, this.zoom)
 
+    p.beginPhase('render:scene')
     if (canUsePicture) {
+      p.beginPhase('render:drawPicture')
       canvas.drawPicture(this.scenePicture!)
+      p.endPhase('render:drawPicture')
     } else if (hasVolatileOverlays) {
+      this._nodeCount = 0
+      this._culledCount = 0
+      p.beginPhase('render:volatile')
       const pageNode = graph.getNode(this.pageId ?? graph.rootId)
       if (pageNode) {
         for (const childId of pageNode.childIds) {
           this.renderNode(canvas, graph, childId, overlays, 0, 0)
         }
       }
+      p.endPhase('render:volatile')
     } else {
+      this._nodeCount = 0
+      this._culledCount = 0
+      p.beginPhase('render:recordPicture')
       this.recordScenePicture(canvas, graph, sceneVersion)
+      p.endPhase('render:recordPicture')
     }
+    p.endPhase('render:scene')
 
     canvas.restore()
 
     // Section titles + component labels (screen coordinates, zoom-independent)
     canvas.save()
     canvas.scale(this.dpr, this.dpr)
+    p.beginPhase('render:sectionTitles')
     this.drawSectionTitles(canvas, graph)
+    p.endPhase('render:sectionTitles')
+    p.beginPhase('render:componentLabels')
     this.drawComponentLabels(canvas, graph)
+    p.endPhase('render:componentLabels')
     canvas.restore()
 
     // UI overlay layer (screen coordinates, zoom-independent)
     canvas.save()
     canvas.scale(this.dpr, this.dpr)
 
+    this.drawHoverHighlight(canvas, graph, overlays.hoveredNodeId)
+    p.beginPhase('render:selection')
     this.drawSelection(canvas, graph, selectedIds, overlays)
+    p.endPhase('render:selection')
     this.drawSnapGuides(canvas, overlays.snapGuides)
     this.drawMarquee(canvas, overlays.marquee)
     this.drawLayoutInsertIndicator(canvas, overlays.layoutInsertIndicator)
     this.drawPenOverlay(canvas, overlays.penState)
     this.drawRemoteCursors(canvas, graph, overlays.remoteCursors)
+    p.beginPhase('render:rulers')
     if (this.showRulers) this.drawRulers(canvas, graph, selectedIds)
+    p.endPhase('render:rulers')
+
+    // Profiler HUD (drawn last, on top of everything)
+    p.drawHUD(canvas, this.showRulers)
 
     canvas.restore()
+
+    p.beginPhase('render:flush')
     this.surface.flush()
+    p.endPhase('render:flush')
+
+    p.setNodeCounts(this._nodeCount, this._culledCount)
+    p.endFrame()
   }
 
   private recordScenePicture(canvas: Canvas, graph: SceneGraph, sceneVersion: number): void {
@@ -581,6 +628,37 @@ export class SkiaRenderer {
   }
 
   // --- Selection UI ---
+
+  private drawHoverHighlight(
+    canvas: Canvas,
+    graph: SceneGraph,
+    hoveredNodeId?: string | null
+  ): void {
+    if (!hoveredNodeId) return
+    const node = graph.getNode(hoveredNodeId)
+    if (!node) return
+
+    const abs = graph.getAbsolutePosition(node.id)
+    const sx = abs.x * this.zoom + this.panX
+    const sy = abs.y * this.zoom + this.panY
+
+    this.auxStroke.setStrokeWidth(1 / this.zoom)
+    this.auxStroke.setColor(
+      this.isComponentType(node.type) ? this.compColor() : this.selColor()
+    )
+    this.auxStroke.setPathEffect(null)
+
+    canvas.save()
+    canvas.translate(sx, sy)
+    if (node.rotation !== 0) {
+      const cx = (node.width / 2) * this.zoom
+      const cy = (node.height / 2) * this.zoom
+      canvas.rotate(node.rotation, cx, cy)
+    }
+    canvas.scale(this.zoom, this.zoom)
+    this.strokeNodeShape(canvas, node, this.auxStroke)
+    canvas.restore()
+  }
 
   private drawSelection(
     canvas: Canvas,
@@ -968,6 +1046,8 @@ export class SkiaRenderer {
     const node = graph.getNode(nodeId)
     if (!node || !node.visible) return
 
+    this._nodeCount++
+
     const absX = parentAbsX + node.x
     const absY = parentAbsY + node.y
 
@@ -993,9 +1073,11 @@ export class SkiaRenderer {
           cx + diag / 2 < vp.x ||
           cy + diag / 2 < vp.y
         ) {
+          this._culledCount++
           return
         }
       } else if (absX > vp.x + vp.w || absY > vp.y + vp.h || absX + bw < vp.x || absY + bh < vp.y) {
+        this._culledCount++
         return
       }
     }
@@ -1048,14 +1130,6 @@ export class SkiaRenderer {
       canvas.drawRect(this.ck.LTRBRect(0, 0, node.width, node.height), this.auxStroke)
     }
 
-    // Hover highlight — shape-aware outline
-    if (overlays.hoveredNodeId === nodeId) {
-      this.auxStroke.setStrokeWidth(1 / this.zoom)
-      this.auxStroke.setColor(this.isComponentType(node.type) ? this.compColor() : this.selColor())
-      this.auxStroke.setPathEffect(null)
-      this.strokeNodeShape(canvas, node, this.auxStroke)
-    }
-
     // Clip + render children for containers
     const isClippableContainer =
       node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE'
@@ -1085,20 +1159,49 @@ export class SkiaRenderer {
     canvas.restore()
   }
 
-  private getVectorPath(node: SceneNode): Path | null {
+  private getVectorPaths(node: SceneNode): Path[] | null {
     if (!node.vectorNetwork) return null
     const cached = this.vectorPathCache.get(node.id)
     if (cached) return cached
-    const path = vectorNetworkToPath(this.ck, node.vectorNetwork)
-    this.vectorPathCache.set(node.id, path)
-    return path
+    const paths = vectorNetworkToPath(this.ck, node.vectorNetwork)
+    this.vectorPathCache.set(node.id, paths)
+    return paths
+  }
+
+  private getFillGeometry(node: SceneNode): Path[] | null {
+    if (node.fillGeometry.length === 0) return null
+    const cached = this.fillGeometryCache.get(node.id)
+    if (cached) return cached
+    const paths = node.fillGeometry.map((g) =>
+      geometryBlobToPath(this.ck, g.commandsBlob, g.windingRule)
+    )
+    this.fillGeometryCache.set(node.id, paths)
+    return paths
+  }
+
+  private getStrokeGeometry(node: SceneNode): Path[] | null {
+    if (node.strokeGeometry.length === 0) return null
+    const cached = this.strokeGeometryCache.get(node.id)
+    if (cached) return cached
+    const paths = node.strokeGeometry.map((g) =>
+      geometryBlobToPath(this.ck, g.commandsBlob, g.windingRule)
+    )
+    this.strokeGeometryCache.set(node.id, paths)
+    return paths
   }
 
   invalidateVectorPath(nodeId: string): void {
     const old = this.vectorPathCache.get(nodeId)
     if (old) {
-      old.delete()
+      for (const p of old) p.delete()
       this.vectorPathCache.delete(nodeId)
+    }
+    for (const cache of [this.fillGeometryCache, this.strokeGeometryCache]) {
+      const oldGeom = cache.get(nodeId)
+      if (oldGeom) {
+        for (const p of oldGeom) p.delete()
+        cache.delete(nodeId)
+      }
     }
   }
 
@@ -1110,8 +1213,10 @@ export class SkiaRenderer {
         canvas.drawOval(rect, paint)
         return
       case 'VECTOR': {
-        const vp = this.getVectorPath(node)
-        if (vp) canvas.drawPath(vp, paint)
+        const vps = this.getVectorPaths(node)
+        if (vps) {
+          for (const vp of vps) canvas.drawPath(vp, paint)
+        }
         return
       }
       case 'LINE':
@@ -1173,7 +1278,7 @@ export class SkiaRenderer {
       this.fillPaint.setShader(null)
     }
 
-    // Stroke
+    // Stroke — sections use a fixed corner radius, not node.cornerRadius
     for (let si = 0; si < node.strokes.length; si++) {
       const stroke = node.strokes[si]!
       if (!stroke.visible) continue
@@ -1181,7 +1286,12 @@ export class SkiaRenderer {
       this.strokePaint.setColor(this.ck.Color4f(sc.r, sc.g, sc.b, sc.a))
       this.strokePaint.setStrokeWidth(stroke.weight)
       this.strokePaint.setAlphaf(stroke.opacity)
-      canvas.drawRRect(rrect, this.strokePaint)
+
+      if (node.independentStrokeWeights) {
+        this.drawIndividualSideStrokes(canvas, node, stroke.align)
+      } else {
+        this.drawRRectStrokeWithAlign(canvas, rrect, node, stroke)
+      }
     }
   }
 
@@ -1475,10 +1585,51 @@ export class SkiaRenderer {
     }
 
     // Strokes
+    const sg = node.type === 'VECTOR' ? this.getStrokeGeometry(node) : null
+    const vectorPaths = !sg && node.type === 'VECTOR' ? this.getVectorPaths(node) : null
     for (let si = 0; si < node.strokes.length; si++) {
       const stroke = node.strokes[si]!
       if (!stroke.visible) continue
       const sc = this.resolveStrokeColor(stroke, si, node, graph)
+
+      if (sg) {
+        this.fillPaint.setColor(this.ck.Color4f(sc.r, sc.g, sc.b, sc.a))
+        this.fillPaint.setAlphaf(stroke.opacity)
+        this.fillPaint.setShader(null)
+        for (const p of sg) canvas.drawPath(p, this.fillPaint)
+        continue
+      }
+
+      if (vectorPaths) {
+        const capMap: Record<string, EmbindEnumEntity> = {
+          NONE: this.ck.StrokeCap.Butt,
+          ROUND: this.ck.StrokeCap.Round,
+          SQUARE: this.ck.StrokeCap.Square
+        }
+        const joinMap: Record<string, EmbindEnumEntity> = {
+          MITER: this.ck.StrokeJoin.Miter,
+          ROUND: this.ck.StrokeJoin.Round,
+          BEVEL: this.ck.StrokeJoin.Bevel
+        }
+        const strokeOpts = {
+          width: stroke.weight,
+          miter_limit: 4,
+          cap: capMap[stroke.cap ?? 'NONE'] ?? this.ck.StrokeCap.Butt,
+          join: joinMap[stroke.join ?? 'MITER'] ?? this.ck.StrokeJoin.Miter
+        }
+        this.fillPaint.setColor(this.ck.Color4f(sc.r, sc.g, sc.b, sc.a))
+        this.fillPaint.setAlphaf(stroke.opacity)
+        this.fillPaint.setShader(null)
+        for (const vp of vectorPaths) {
+          const outline = vp.copy().stroke(strokeOpts)
+          if (outline) {
+            canvas.drawPath(outline, this.fillPaint)
+            outline.delete()
+          }
+        }
+        continue
+      }
+
       this.strokePaint.setColor(this.ck.Color4f(sc.r, sc.g, sc.b, sc.a))
       this.strokePaint.setStrokeWidth(stroke.weight)
       this.strokePaint.setAlphaf(stroke.opacity)
@@ -1505,7 +1656,11 @@ export class SkiaRenderer {
         this.strokePaint.setPathEffect(null)
       }
 
-      this.drawNodeStroke(canvas, node, rect, hasRadius)
+      if (node.independentStrokeWeights && this.isRectangularType(node.type)) {
+        this.drawIndividualSideStrokes(canvas, node, stroke.align)
+      } else {
+        this.drawStrokeWithAlign(canvas, node, rect, hasRadius, stroke.align)
+      }
     }
 
     // Effects (front: inner shadow, blur)
@@ -1520,8 +1675,15 @@ export class SkiaRenderer {
   ): void {
     switch (node.type) {
       case 'VECTOR': {
-        const vp = this.getVectorPath(node)
-        if (vp) canvas.drawPath(vp, this.fillPaint)
+        const fg = this.getFillGeometry(node)
+        if (fg) {
+          for (const p of fg) canvas.drawPath(p, this.fillPaint)
+        } else {
+          const vps = this.getVectorPaths(node)
+          if (vps) {
+            for (const vp of vps) canvas.drawPath(vp, this.fillPaint)
+          }
+        }
         break
       }
       case 'ELLIPSE':
@@ -1561,8 +1723,10 @@ export class SkiaRenderer {
   ): void {
     switch (node.type) {
       case 'VECTOR': {
-        const vp = this.getVectorPath(node)
-        if (vp) canvas.drawPath(vp, this.strokePaint)
+        const vps = this.getVectorPaths(node)
+        if (vps) {
+          for (const vp of vps) canvas.drawPath(vp, this.strokePaint)
+        }
         break
       }
       case 'ELLIPSE':
@@ -1585,6 +1749,165 @@ export class SkiaRenderer {
         } else {
           canvas.drawRect(rect, this.strokePaint)
         }
+    }
+  }
+
+  private drawRRectStrokeWithAlign(
+    canvas: Canvas,
+    rrect: Float32Array,
+    node: SceneNode,
+    stroke: Stroke
+  ): void {
+    if (stroke.align === 'INSIDE') {
+      canvas.save()
+      canvas.clipRRect(rrect, this.ck.ClipOp.Intersect, true)
+      this.strokePaint.setStrokeWidth(stroke.weight * 2)
+      canvas.drawRRect(rrect, this.strokePaint)
+      this.strokePaint.setStrokeWidth(stroke.weight)
+      canvas.restore()
+    } else if (stroke.align === 'OUTSIDE') {
+      canvas.save()
+      const outerPath = new this.ck.Path()
+      outerPath.addRect(
+        this.ck.LTRBRect(-node.width, -node.height, node.width * 2, node.height * 2)
+      )
+      const innerPath = new this.ck.Path()
+      innerPath.addRRect(rrect)
+      outerPath.op(innerPath, this.ck.PathOp.Difference)
+      innerPath.delete()
+      canvas.clipPath(outerPath, this.ck.ClipOp.Intersect, true)
+      outerPath.delete()
+      this.strokePaint.setStrokeWidth(stroke.weight * 2)
+      canvas.drawRRect(rrect, this.strokePaint)
+      this.strokePaint.setStrokeWidth(stroke.weight)
+      canvas.restore()
+    } else {
+      canvas.drawRRect(rrect, this.strokePaint)
+    }
+  }
+
+  private isRectangularType(type: string): boolean {
+    return (
+      type === 'FRAME' ||
+      type === 'RECTANGLE' ||
+      type === 'ROUNDED_RECTANGLE' ||
+      type === 'COMPONENT' ||
+      type === 'INSTANCE' ||
+      type === 'SECTION' ||
+      type === 'GROUP'
+    )
+  }
+
+  private drawStrokeWithAlign(
+    canvas: Canvas,
+    node: SceneNode,
+    rect: Float32Array,
+    hasRadius: boolean,
+    align: 'INSIDE' | 'CENTER' | 'OUTSIDE'
+  ): void {
+    if (align === 'INSIDE') {
+      canvas.save()
+      this.clipNodeShape(canvas, node, rect, hasRadius)
+      const origWidth = this.strokePaint.getStrokeWidth()
+      this.strokePaint.setStrokeWidth(origWidth * 2)
+      this.drawNodeStroke(canvas, node, rect, hasRadius)
+      this.strokePaint.setStrokeWidth(origWidth)
+      canvas.restore()
+    } else if (align === 'OUTSIDE') {
+      canvas.save()
+      const bigRect = this.ck.LTRBRect(
+        -node.width,
+        -node.height,
+        node.width * 2,
+        node.height * 2
+      )
+      const outerPath = new this.ck.Path()
+      outerPath.addRect(bigRect)
+      const innerPath = this.makeNodeShapePath(node, rect, hasRadius)
+      outerPath.op(innerPath, this.ck.PathOp.Difference)
+      innerPath.delete()
+      canvas.clipPath(outerPath, this.ck.ClipOp.Intersect, true)
+      outerPath.delete()
+      const origWidth = this.strokePaint.getStrokeWidth()
+      this.strokePaint.setStrokeWidth(origWidth * 2)
+      this.drawNodeStroke(canvas, node, rect, hasRadius)
+      this.strokePaint.setStrokeWidth(origWidth)
+      canvas.restore()
+    } else {
+      this.drawNodeStroke(canvas, node, rect, hasRadius)
+    }
+  }
+
+  private makeNodeShapePath(
+    node: SceneNode,
+    rect: Float32Array,
+    hasRadius: boolean
+  ): Path {
+    const path = new this.ck.Path()
+    switch (node.type) {
+      case 'ELLIPSE':
+        path.addOval(rect)
+        break
+      case 'VECTOR': {
+        const vps = this.getVectorPaths(node)
+        if (vps) {
+          for (const vp of vps) path.addPath(vp)
+        }
+        break
+      }
+      case 'POLYGON':
+      case 'STAR': {
+        const polyPath = this.makePolygonPath(node)
+        path.addPath(polyPath)
+        polyPath.delete()
+        break
+      }
+      default:
+        if (hasRadius) {
+          path.addRRect(this.makeRRect(node))
+        } else {
+          path.addRect(rect)
+        }
+    }
+    return path
+  }
+
+  private drawIndividualSideStrokes(
+    canvas: Canvas,
+    node: SceneNode,
+    align: 'INSIDE' | 'CENTER' | 'OUTSIDE'
+  ): void {
+    const w = node.width
+    const h = node.height
+    const inside = align === 'INSIDE'
+    const outside = align === 'OUTSIDE'
+
+    const tw = node.borderTopWeight
+    if (tw > 0) {
+      const y = inside ? tw / 2 : outside ? -tw / 2 : 0
+      this.strokePaint.setStrokeWidth(tw)
+      canvas.drawLine(0, y, w, y, this.strokePaint)
+    }
+
+    const rw = node.borderRightWeight
+    if (rw > 0) {
+      const x = inside ? w - rw / 2 : outside ? w + rw / 2 : w
+      this.strokePaint.setStrokeWidth(rw)
+      canvas.drawLine(x, 0, x, h, this.strokePaint)
+    }
+
+    const bw = node.borderBottomWeight
+    if (bw > 0) {
+      const y = inside ? h - bw / 2 : outside ? h + bw / 2 : h
+      this.strokePaint.setStrokeWidth(bw)
+      canvas.drawLine(0, y, w, y, this.strokePaint)
+    }
+
+    const lw = node.borderLeftWeight
+    if (lw > 0) {
+      const x = inside ? lw / 2 : outside ? -lw / 2 : 0
+      this.strokePaint.setStrokeWidth(lw)
+      canvas.drawLine(x, 0, x, h, this.strokePaint)
     }
   }
 
@@ -1945,7 +2268,7 @@ export class SkiaRenderer {
 
     if (this.fontsLoaded && this.fontProvider) {
       if (this.isNodeFontLoaded(node)) {
-        const paragraph = this.buildParagraph(node, this.fillPaint.getColor())
+        const paragraph = this.buildParagraph(node, this.fillPaint.getColor(), { halfLeading: true })
         canvas.drawParagraph(paragraph, 0, 0)
         paragraph.delete()
       } else if (node.textPicture) {
@@ -1962,9 +2285,21 @@ export class SkiaRenderer {
     }
   }
 
+  measureTextNode(node: SceneNode): { width: number; height: number } | null {
+    if (!this.fontsLoaded || !this.fontProvider || !this.isNodeFontLoaded(node)) return null
+    if (node.type !== 'TEXT' || !node.text) return null
+
+    const paragraph = this.buildParagraph(node)
+    paragraph.layout(node.textAutoResize === 'WIDTH_AND_HEIGHT' ? 1e6 : node.width || 1e6)
+    const width = paragraph.getLongestLine()
+    const height = paragraph.getHeight()
+    paragraph.delete()
+    return { width: Math.ceil(width), height: Math.ceil(height) }
+  }
+
   isNodeFontLoaded(node: SceneNode): boolean {
     const families = new Set<string>()
-    families.add(node.fontFamily || 'Inter')
+    families.add(node.fontFamily || DEFAULT_FONT_FAMILY)
     for (const run of node.styleRuns) {
       if (run.style.fontFamily) families.add(run.style.fontFamily)
     }
@@ -1980,7 +2315,7 @@ export class SkiaRenderer {
     const bounds = ck.LTRBRect(0, 0, node.width || 1e6, node.height || 1e6)
     const recCanvas = recorder.beginRecording(bounds)
 
-    const paragraph = this.buildParagraph(node)
+    const paragraph = this.buildParagraph(node, undefined, { halfLeading: true })
     recCanvas.drawParagraph(paragraph, 0, 0)
     paragraph.delete()
 
@@ -1992,16 +2327,36 @@ export class SkiaRenderer {
     return bytes ?? null
   }
 
-  buildParagraph(node: SceneNode, color?: Float32Array): import('canvaskit-wasm').Paragraph {
+  buildParagraph(
+    node: SceneNode,
+    color?: Float32Array,
+    { halfLeading = false }: { halfLeading?: boolean } = {}
+  ): import('canvaskit-wasm').Paragraph {
     const ck = this.ck
     const baseColor = color ?? ck.BLACK
     const baseFontSize = node.fontSize || DEFAULT_FONT_SIZE
+    const cjkFallback = getCJKFallbackFamily()
+
+    const truncateOpts: { maxLines?: number; ellipsis?: string } = {}
+    if (node.textTruncation === 'ENDING') {
+      if (node.maxLines != null && node.maxLines > 0) {
+        truncateOpts.maxLines = node.maxLines
+      } else if (node.height > 0) {
+        const lineH = node.lineHeight || baseFontSize * 1.2
+        truncateOpts.maxLines = Math.max(1, Math.floor(node.height / lineH))
+      }
+      truncateOpts.ellipsis = '…'
+    }
+
+    const fontFamilies = (primary: string) =>
+      cjkFallback ? [primary, cjkFallback] : [primary]
 
     const paraStyle = new ck.ParagraphStyle({
       textAlign: this.getTextAlign(node.textAlignHorizontal),
+      ...truncateOpts,
       textStyle: {
         color: baseColor,
-        fontFamilies: [node.fontFamily || 'Inter'],
+        fontFamilies: fontFamilies(node.fontFamily || DEFAULT_FONT_FAMILY),
         fontSize: baseFontSize,
         fontStyle: {
           weight: { value: node.fontWeight || 400 } as FontWeight,
@@ -2009,7 +2364,8 @@ export class SkiaRenderer {
         },
         letterSpacing: node.letterSpacing || 0,
         decoration: this.textDecorationValue(node.textDecoration),
-        heightMultiplier: node.lineHeight ? node.lineHeight / baseFontSize : undefined
+        heightMultiplier: node.lineHeight ? node.lineHeight / baseFontSize : undefined,
+        halfLeading
       }
     })
 
@@ -2029,7 +2385,7 @@ export class SkiaRenderer {
         builder.pushStyle(
           new ck.TextStyle({
             color: baseColor,
-            fontFamilies: [s.fontFamily ?? (node.fontFamily || 'Inter')],
+            fontFamilies: fontFamilies(s.fontFamily ?? (node.fontFamily || DEFAULT_FONT_FAMILY)),
             fontSize: s.fontSize ?? baseFontSize,
             fontStyle: {
               weight: { value: (s.fontWeight ?? node.fontWeight) || 400 } as FontWeight,
@@ -2040,7 +2396,8 @@ export class SkiaRenderer {
             heightMultiplier: (s.lineHeight !== undefined ? s.lineHeight : node.lineHeight)
               ? (s.lineHeight !== undefined ? s.lineHeight : node.lineHeight)! /
                 (s.fontSize ?? baseFontSize)
-              : undefined
+              : undefined,
+            halfLeading
           })
         )
         builder.addText(text.slice(run.start, run.start + run.length))
@@ -2705,11 +3062,20 @@ export class SkiaRenderer {
     return Math.round(value).toString()
   }
 
+  private destroyed = false
+
   destroy(): void {
+    if (this.destroyed) return
+    this.destroyed = true
+
     for (const img of this.imageCache.values()) img.delete()
     this.imageCache.clear()
-    for (const p of this.vectorPathCache.values()) p.delete()
-    this.vectorPathCache.clear()
+    for (const cache of [this.vectorPathCache, this.fillGeometryCache, this.strokeGeometryCache]) {
+      for (const paths of cache.values()) {
+        for (const p of paths) p.delete()
+      }
+      cache.clear()
+    }
     this.fillPaint.delete()
     this.strokePaint.delete()
     this.selectionPaint.delete()
@@ -2733,13 +3099,14 @@ export class SkiaRenderer {
     this.penVertexFill.delete()
     this.penVertexStroke.delete()
     this.effectLayerPaint.delete()
-    for (const filter of this.imageFilterCache.values()) filter.delete()
+    for (const filter of this.imageFilterCache.values()) filter?.delete()
     this.imageFilterCache.clear()
-    for (const filter of this.maskFilterCache.values()) filter.delete()
+    for (const filter of this.maskFilterCache.values()) filter?.delete()
     this.maskFilterCache.clear()
-    for (const pic of this.nodePictureCache.values()) pic.delete()
+    for (const pic of this.nodePictureCache.values()) pic?.delete()
     this.nodePictureCache.clear()
     this.scenePicture?.delete()
+    this.profiler.destroy()
     this.surface.delete()
   }
 }

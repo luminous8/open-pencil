@@ -118,7 +118,8 @@ export function useCanvas(canvasRef: Ref<HTMLCanvasElement | null>, store: Edito
       }
     }
 
-    renderer = new SkiaRenderer(ck, surface)
+    const glCtx = (canvas.getContext('webgl2') ?? null) as WebGL2RenderingContext | null
+    renderer = new SkiaRenderer(ck, surface, glCtx)
     store.setCanvasKit(ck, renderer)
     renderer.loadFonts().then(() => renderNow())
     renderNow()
@@ -129,7 +130,7 @@ export function useCanvas(canvasRef: Ref<HTMLCanvasElement | null>, store: Edito
   const showRulers = !params.has('no-rulers')
 
   function renderNow() {
-    if (!renderer) return
+    if (!renderer || destroyed) return
     renderer.dpr = window.devicePixelRatio || 1
     renderer.panX = store.state.panX
     renderer.panY = store.state.panY

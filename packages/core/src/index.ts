@@ -33,6 +33,7 @@ export {
   type VectorVertex,
   type VectorSegment,
   type VectorRegion,
+  type GeometryPath,
   type HandleMirroring,
   type WindingRule,
   type VariableType,
@@ -48,21 +49,29 @@ export { FigmaAPI, FigmaNodeProxy, type FigmaFontName } from './figma-api'
 export { ALL_TOOLS, defineTool, toolsToAI } from './tools'
 export type { ToolDef, ParamDef, ParamType } from './tools'
 export { SkiaRenderer, type RenderOverlays } from './renderer'
-export { computeLayout, computeAllLayouts } from './layout'
+export { RenderProfiler } from './profiler'
+export type { FrameCapture, NodeProfile } from './profiler'
+export { computeLayout, computeAllLayouts, setTextMeasurer } from './layout'
+export type { TextMeasurer } from './layout'
 export { getCanvasKit, getGpuBackend, type CanvasKitOptions, type GpuBackend } from './canvaskit'
 export {
+  collectFontKeys,
   loadFont,
   listFamilies,
   initFontService,
   getFontProvider,
   isFontLoaded,
+  markFontLoaded,
   ensureNodeFont,
+  ensureCJKFallback,
+  getCJKFallbackFamily,
   styleToWeight,
   weightToStyle
 } from './fonts'
 export { parseColor, colorToHex, colorToHexRaw, colorToRgba255 } from './color'
 export {
   vectorNetworkToPath,
+  geometryBlobToPath,
   decodeVectorNetworkBlob,
   encodeVectorNetworkBlob,
   computeVectorBounds
@@ -77,7 +86,14 @@ export {
   adjustRunsForInsert,
   adjustRunsForDelete
 } from './style-runs'
-export { renderNodesToImage, renderThumbnail, type ExportFormat } from './render-image'
+export { renderNodesToImage, renderThumbnail, computeContentBounds, type ExportFormat } from './render-image'
+export {
+  renderNodesToSVG,
+  geometryBlobToSVGPath,
+  vectorNetworkToSVGPaths,
+  type SVGExportOptions
+} from './svg-export'
+export { svg, renderSVGNode, type SVGNode } from './svg-node'
 export { exportFigFile } from './fig-export'
 export {
   FIG_KIWI_VERSION,

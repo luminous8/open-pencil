@@ -1,3 +1,4 @@
+import { collectFontKeys } from '@open-pencil/core'
 import { shallowReactive, shallowRef, computed, watch } from 'vue'
 
 import {
@@ -21,9 +22,11 @@ import {
   prefetchFigmaSchema
 } from '@/engine/clipboard'
 import { exportFigFile } from '@/engine/fig-export'
-import { computeLayout, computeAllLayouts } from '@/engine/layout'
+import { loadFont } from '@/engine/fonts'
+import { computeLayout, computeAllLayouts, setTextMeasurer } from '@/engine/layout'
 import { renderNodesToImage } from '@/engine/render-image'
 import { SceneGraph } from '@/engine/scene-graph'
+import { renderNodesToSVG } from '@/engine/svg-export'
 import { TextEditor } from '@/engine/text-editor'
 import { UndoManager } from '@/engine/undo'
 import { computeVectorBounds } from '@/engine/vector'
@@ -187,7 +190,8 @@ export function createEditorStore() {
     zoom: 1,
     renderVersion: 0,
     sceneVersion: 0,
-    loading: false
+    loading: false,
+    autosaveEnabled: true
   })
 
   const AUTOSAVE_DELAY = 3000
@@ -196,10 +200,12 @@ export function createEditorStore() {
     () => state.sceneVersion,
     (version) => {
       if (version === savedVersion) return
+      if (!state.autosaveEnabled) return
       if (!fileHandle && !filePath) return
       clearTimeout(autosaveTimer)
       autosaveTimer = setTimeout(async () => {
         if (state.sceneVersion === savedVersion) return
+        if (!state.autosaveEnabled) return
         try {
           await writeFile(await buildFigFile())
         } catch {
@@ -271,6 +277,7 @@ export function createEditorStore() {
       state.pageColor = { ...CANVAS_BG_COLOR }
     }
 
+    void loadFontsForNodes(graph.getChildren(pageId).map((n) => n.id))
     requestRender()
   }
 
@@ -584,6 +591,7 @@ export function createEditorStore() {
       state.panY = 0
       state.zoom = 1
       state.pageColor = { ...CANVAS_BG_COLOR }
+      await loadFontsForNodes(graph.getChildren(firstPage?.id ?? graph.rootId).map((n) => n.id))
       requestRender()
       startWatchingFile()
     } catch (e) {
@@ -600,6 +608,7 @@ export function createEditorStore() {
     _ck = ck
     _renderer = renderer
     _textEditor = new TextEditor(ck)
+    setTextMeasurer((node) => renderer.measureTextNode(node))
   }
 
   function buildFigFile() {
@@ -801,6 +810,21 @@ export function createEditorStore() {
 
   async function exportSelection(scale: number, format: ExportFormat) {
     const ids = [...state.selectedIds]
+
+    if (format === 'SVG') {
+      const nodeIds = ids.length > 0 ? ids : graph.getChildren(state.currentPageId).map((n) => n.id)
+      const svgStr = renderNodesToSVG(graph, state.currentPageId, nodeIds)
+      if (!svgStr) {
+        console.error('Export failed: renderNodesToSVG returned null')
+        return
+      }
+      const svgData = new TextEncoder().encode(svgStr)
+      const node = ids.length === 1 ? graph.getNode(ids[0]) : undefined
+      const fileName = `${node?.name ?? 'Export'}.svg`
+      await saveExportedFile(svgData, fileName, 'SVG', '.svg', 'image/svg+xml')
+      return
+    }
+
     const data = await renderExportImage(ids, scale, format)
     if (!data) {
       console.error(
@@ -813,7 +837,16 @@ export function createEditorStore() {
     const baseName = node?.name ?? 'Export'
     const ext = exportImageExtension(format)
     const fileName = `${baseName}@${scale}x${ext}`
+    await saveExportedFile(new Uint8Array(data), fileName, format, ext, exportImageMime(format))
+  }
 
+  async function saveExportedFile(
+    data: Uint8Array,
+    fileName: string,
+    format: string,
+    ext: string,
+    mime: string
+  ) {
     if (IS_TAURI) {
       const { save } = await import('@tauri-apps/plugin-dialog')
       const path = await save({
@@ -832,8 +865,8 @@ export function createEditorStore() {
           suggestedName: fileName,
           types: [
             {
-              description: `${format} image`,
-              accept: { [exportImageMime(format)]: [ext] }
+              description: `${format} file`,
+              accept: { [mime]: [ext] }
             }
           ]
         })
@@ -846,7 +879,7 @@ export function createEditorStore() {
       }
     }
 
-    downloadBlob(new Uint8Array(data), fileName, exportImageMime(format))
+    downloadBlob(data, fileName, mime)
   }
 
   function runLayoutForNode(id: string) {
@@ -1469,6 +1502,11 @@ export function createEditorStore() {
     requestRender()
   }
 
+  function toggleProfiler() {
+    _renderer?.profiler.toggle()
+    requestRepaint()
+  }
+
   function toggleVisibility() {
     for (const id of state.selectedIds) {
       const node = graph.getNode(id)
@@ -1691,6 +1729,15 @@ export function createEditorStore() {
     return result
   }
 
+  async function loadFontsForNodes(nodeIds: string[]) {
+    const toLoad = collectFontKeys(graph, nodeIds)
+    if (toLoad.length === 0) return
+
+    await Promise.all(toLoad.map(([family, style]) => loadFont(family, style)))
+    computeAllLayouts(graph, state.currentPageId)
+    requestRender()
+  }
+
   function pasteFromHTML(html: string) {
     const ownNodes = parseOpenPencilClipboard(html)
     if (ownNodes) {
@@ -1716,7 +1763,7 @@ export function createEditorStore() {
           figma.blobs
         )
         if (created.length > 0) {
-          computeAllLayouts(graph)
+          computeAllLayouts(graph, state.currentPageId)
           state.selectedIds = new Set(created)
 
           const allNodes = collectSubtrees(graph, created)
@@ -1730,17 +1777,18 @@ export function createEditorStore() {
                   childIds: []
                 })
               }
-              computeAllLayouts(graph)
+              computeAllLayouts(graph, pageId)
               state.selectedIds = new Set(created)
               requestRender()
             },
             inverse: () => {
               for (const id of [...created].reverse()) graph.deleteNode(id)
-              computeAllLayouts(graph)
+              computeAllLayouts(graph, pageId)
               state.selectedIds = prevSelection
               requestRender()
             }
           })
+          void loadFontsForNodes(created)
           requestRender()
         }
       }
@@ -2041,6 +2089,7 @@ export function createEditorStore() {
     goToMainComponent,
     bringToFront,
     sendToBack,
+    toggleProfiler,
     toggleVisibility,
     toggleLock,
     moveToPage,

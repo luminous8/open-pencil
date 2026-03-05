@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import {
+  MenubarCheckboxItem,
   MenubarContent,
   MenubarItem,
+  MenubarItemIndicator,
   MenubarMenu,
   MenubarPortal,
   MenubarRoot,
@@ -50,6 +52,8 @@ interface MenuItem {
   action?: () => void
   separator?: boolean
   disabled?: boolean
+  checked?: boolean
+  onCheckedChange?: (checked: boolean) => void
   sub?: MenuItem[]
 }
 
@@ -71,6 +75,16 @@ const fileMenu: MenuItem[] = [
       if (store.state.selectedIds.size > 0) store.exportSelection(1, 'PNG')
     },
     disabled: store.state.selectedIds.size === 0
+  },
+  { separator: true },
+  {
+    label: 'Auto-save to local file',
+    get checked() {
+      return store.state.autosaveEnabled
+    },
+    onCheckedChange: (v: boolean) => {
+      store.state.autosaveEnabled = v
+    }
   }
 ]
 
@@ -97,6 +111,16 @@ const viewMenu: MenuItem[] = [
     label: 'Zoom out',
     shortcut: `${mod}-`,
     action: () => store.applyZoom(100, window.innerWidth / 2, window.innerHeight / 2)
+  },
+  { separator: true },
+  {
+    label: 'Performance profiler',
+    get checked() {
+      return store.renderer?.profiler.hudVisible ?? false
+    },
+    onCheckedChange: () => {
+      store.toggleProfiler()
+    }
   }
 ]
 
@@ -150,10 +174,11 @@ const topMenus = [
 <template>
   <div class="shrink-0 border-b border-border">
     <div class="flex items-center gap-2 px-2 py-1.5">
-      <img src="/favicon-32.png" class="size-4" alt="OpenPencil" />
+      <img data-test-id="app-logo" src="/favicon-32.png" class="size-4" alt="OpenPencil" />
       <input
         v-if="editingName"
         data-doc-name-edit
+        data-test-id="app-document-name-input"
         class="min-w-0 flex-1 rounded border border-accent bg-input px-1 py-0.5 text-xs text-surface outline-none"
         :value="store.state.documentName"
         @blur="commitRename($event.target as HTMLInputElement)"
@@ -162,11 +187,13 @@ const topMenus = [
       />
       <span
         v-else
+        data-test-id="app-document-name"
         class="min-w-0 flex-1 cursor-default truncate rounded px-1 py-0.5 text-xs text-surface hover:bg-hover"
         @dblclick="startRename"
         >{{ store.state.documentName }}</span
       >
       <button
+        data-test-id="app-toggle-ui"
         class="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted transition-colors hover:bg-hover hover:text-surface"
         title="Toggle UI (⌘\)"
         @click="store.state.showUI = !store.state.showUI"
@@ -178,6 +205,7 @@ const topMenus = [
       <MenubarRoot class="flex items-center gap-0.5 overflow-x-auto scrollbar-none">
         <MenubarMenu v-for="menu in topMenus" :key="menu.label">
           <MenubarTrigger
+            :data-test-id="`menubar-${menu.label.toLowerCase()}`"
             class="flex cursor-pointer items-center rounded px-2 py-1 text-xs text-muted transition-colors select-none hover:bg-hover hover:text-surface data-[state=open]:bg-hover data-[state=open]:text-surface"
           >
             {{ menu.label }}
@@ -221,6 +249,17 @@ const topMenus = [
                     </MenubarSubContent>
                   </MenubarPortal>
                 </MenubarSub>
+                <MenubarCheckboxItem
+                  v-else-if="item.onCheckedChange"
+                  :model-value="item.checked"
+                  class="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-surface outline-none select-none hover:bg-hover"
+                  @update:model-value="item.onCheckedChange?.($event as boolean)"
+                >
+                  <span class="flex-1">{{ item.label }}</span>
+                  <MenubarItemIndicator class="text-surface">
+                    <icon-lucide-check class="size-3.5" />
+                  </MenubarItemIndicator>
+                </MenubarCheckboxItem>
                 <MenubarItem
                   v-else
                   class="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs outline-none select-none"

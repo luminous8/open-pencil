@@ -193,7 +193,7 @@ export const render = defineTool({
     parent_id: { type: 'string', description: 'Parent node ID to render into' }
   },
   execute: async (figma, args) => {
-    const { renderJsx } = await import('../render/render-jsx')
+    const { renderJsx } = await import('../render/render-jsx.js')
     const result = await renderJsx(figma.graph, args.jsx, {
       parentId: args.parent_id ?? figma.currentPageId,
       x: args.x,
@@ -1046,7 +1046,7 @@ export const nodeReplaceWith = defineTool({
     const x = node.x
     const y = node.y
     node.remove()
-    const { renderJsx } = await import('../render/render-jsx')
+    const { renderJsx } = await import('../render/render-jsx.js')
     const result = await renderJsx(figma.graph, args.jsx, { parentId, x, y })
     return { id: result.id, name: result.name, type: result.type }
   }
@@ -1711,6 +1711,30 @@ export const setLayoutChild = defineTool({
   }
 })
 
+// ─── Export tools ─────────────────────────────────────────────
+
+export const exportSvg = defineTool({
+  name: 'export_svg',
+  description: 'Export nodes as SVG markup. Returns the SVG string.',
+  params: {
+    ids: {
+      type: 'string[]',
+      description: 'Node IDs to export. Omit to export all top-level nodes on the current page.'
+    }
+  },
+  execute: async (figma, args) => {
+    const { renderNodesToSVG } = await import('../svg-export.js')
+    const pageId = figma.currentPageId
+    const ids =
+      args.ids && args.ids.length > 0
+        ? args.ids
+        : figma.currentPage.children.map((n) => n.id)
+    const svg = renderNodesToSVG(figma.graph, pageId, ids)
+    if (!svg) return { error: 'No visible nodes to export' }
+    return { svg }
+  }
+})
+
 // ─── Registry ─────────────────────────────────────────────────
 
 export const ALL_TOOLS: ToolDef[] = [
@@ -1800,5 +1824,7 @@ export const ALL_TOOLS: ToolDef[] = [
   // Text properties
   setTextProperties,
   // Layout child
-  setLayoutChild
+  setLayoutChild,
+  // Export
+  exportSvg
 ]

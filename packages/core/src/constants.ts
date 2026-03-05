@@ -32,6 +32,7 @@ export const PEN_CLOSE_RADIUS_BOOST = 2
 export const PEN_PATH_STROKE_WIDTH = 2
 export const PARENT_OUTLINE_ALPHA = 0.5
 export const PARENT_OUTLINE_DASH = 4
+export const DEFAULT_FONT_FAMILY = 'Inter'
 export const DEFAULT_FONT_SIZE = 14
 export const DEFAULT_STROKE_MITER_LIMIT = 4
 export const LABEL_FONT_SIZE = 11
@@ -121,3 +122,30 @@ export const AI_MODELS: ModelOption[] = [
 ]
 
 export const DEFAULT_AI_MODEL = AI_MODELS[0].id
+
+export const GOOGLE_FONTS_API_KEY = 'AIzaSyD1tYDR_dUEiV-Tw1vksEhZbUytgKW5pc8'
+
+export const CJK_FALLBACK_FAMILIES_MACOS = [
+  'PingFang SC',
+  'Hiragino Sans',
+  'Apple SD Gothic Neo',
+  'Heiti SC'
+]
+
+export const CJK_FALLBACK_FAMILIES_WINDOWS = [
+  'Microsoft YaHei',
+  'Microsoft JhengHei',
+  'Yu Gothic',
+  'Malgun Gothic',
+  'SimHei'
+]
+
+export const CJK_FALLBACK_FAMILIES_LINUX = [
+  'Noto Sans CJK SC',
+  'Noto Sans CJK JP',
+  'Noto Sans CJK KR',
+  'WenQuanYi Micro Hei',
+  'Droid Sans Fallback'
+]
+
+export const CJK_GOOGLE_FONT = 'Noto Sans SC'

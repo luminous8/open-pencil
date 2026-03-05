@@ -1,6 +1,7 @@
 import Yoga, {
   Align,
   Direction,
+  Display,
   FlexDirection,
   Gutter,
   Justify,
@@ -10,6 +11,14 @@ import Yoga, {
 } from 'yoga-layout'
 
 import type { SceneGraph, SceneNode } from './scene-graph'
+
+export type TextMeasurer = (node: SceneNode) => { width: number; height: number } | null
+
+let globalTextMeasurer: TextMeasurer | null = null
+
+export function setTextMeasurer(measurer: TextMeasurer | null): void {
+  globalTextMeasurer = measurer
+}
 
 export function computeLayout(graph: SceneGraph, frameId: string): void {
   const frame = graph.getNode(frameId)
@@ -21,9 +30,9 @@ export function computeLayout(graph: SceneGraph, frameId: string): void {
   freeYogaTree(yogaRoot)
 }
 
-export function computeAllLayouts(graph: SceneGraph): void {
+export function computeAllLayouts(graph: SceneGraph, scopeId?: string): void {
   const visited = new Set<string>()
-  computeLayoutsBottomUp(graph, graph.rootId, visited)
+  computeLayoutsBottomUp(graph, scopeId ?? graph.rootId, visited)
 }
 
 function computeLayoutsBottomUp(graph: SceneGraph, nodeId: string, visited: Set<string>): void {
@@ -81,7 +90,9 @@ function buildYogaTree(graph: SceneGraph, frame: SceneNode): YogaNode {
 
     const yogaChild = Yoga.Node.create()
 
-    if (child.layoutMode !== 'NONE') {
+    if (!child.visible) {
+      yogaChild.setDisplay(Display.None)
+    } else if (child.layoutMode !== 'NONE') {
       configureChildAsAutoLayout(yogaChild, child, frame, graph)
     } else {
       configureChildAsLeaf(yogaChild, child, frame)
@@ -142,7 +153,9 @@ function configureChildAsAutoLayout(
   for (const gc of grandchildren) {
     if (gc.layoutPositioning === 'ABSOLUTE') continue
     const yogaGC = Yoga.Node.create()
-    if (gc.layoutMode !== 'NONE') {
+    if (!gc.visible) {
+      yogaGC.setDisplay(Display.None)
+    } else if (gc.layoutMode !== 'NONE') {
       configureChildAsAutoLayout(yogaGC, gc, child, graph)
     } else {
       configureChildAsLeaf(yogaGC, gc, child)
@@ -155,25 +168,36 @@ function configureChildAsLeaf(yogaChild: YogaNode, child: SceneNode, parent: Sce
   const isRow = parent.layoutMode === 'HORIZONTAL'
   const stretchCross = child.layoutAlignSelf === 'STRETCH' || parent.counterAxisAlign === 'STRETCH'
 
+  const measured = child.type === 'TEXT' && child.textAutoResize === 'WIDTH_AND_HEIGHT'
+    ? measureTextSize(child)
+    : null
+  const w = measured ? measured.width : child.width
+  const h = child.height
+
   if (child.layoutGrow > 0) {
     yogaChild.setFlexGrow(child.layoutGrow)
     if (!stretchCross) {
-      if (isRow) yogaChild.setHeight(child.height)
-      else yogaChild.setWidth(child.width)
+      if (isRow) yogaChild.setHeight(h)
+      else yogaChild.setWidth(w)
     }
   } else {
     if (isRow) {
-      yogaChild.setWidth(child.width)
-      if (!stretchCross) yogaChild.setHeight(child.height)
+      yogaChild.setWidth(w)
+      if (!stretchCross) yogaChild.setHeight(h)
     } else {
-      yogaChild.setHeight(child.height)
-      if (!stretchCross) yogaChild.setWidth(child.width)
+      yogaChild.setHeight(h)
+      if (!stretchCross) yogaChild.setWidth(w)
     }
   }
 
   if (child.layoutAlignSelf === 'STRETCH') {
     yogaChild.setAlignSelf(Align.Stretch)
   }
+}
+
+function measureTextSize(node: SceneNode): { width: number; height: number } | null {
+  if (!globalTextMeasurer) return null
+  return globalTextMeasurer(node)
 }
 
 function setSizing(
@@ -228,6 +252,7 @@ function applyYogaLayout(graph: SceneGraph, frame: SceneNode, yogaNode: YogaNode
 
     const yogaChild = yogaNode.getChild(yogaIndex)
     yogaIndex++
+    if (!yogaChild) continue
 
     graph.updateNode(child.id, {
       x: yogaChild.getComputedLeft(),

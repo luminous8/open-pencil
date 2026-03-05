@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-03-05
+
+### Features
+
+- SVG export — export selections as SVG from the export panel, context menu, CLI (`bun open-pencil export --format svg`), or MCP/AI tools (`export_svg`). Supports rectangles, ellipses, lines, stars, polygons, vectors, text with style runs, gradients, image fills, effects, blend modes, clip paths, and nested groups (#46)
+- Copy/Paste as submenu in context menu — Copy as text, Copy as SVG, Copy as PNG (⇧⌘C), Copy as JSX
+- Stroke align (Inside/Center/Outside) with clip-based rendering matching Figma behavior
+- Individual stroke weights per side (Top/Right/Bottom/Left) with side selector dropdown
+- Google Fonts fallback — automatically loads fonts from Google Fonts API when not available locally
+- Auto-save toggle in File menu — disable to prevent automatic writes to the opened .fig file
+- Renderer profiler with in-canvas HUD overlay, GPU timing, and phase instrumentation
+
+### Improvements
+
+- Replace custom color picker with Reka UI Color components (ColorArea, ColorSlider, ColorField) — adds keyboard navigation and accessibility to the color area, hue, and alpha controls
+
+### Fixes
+
+- CJK text rendering — load a system CJK font (PingFang SC, Microsoft YaHei, Noto Sans CJK) as fallback; falls back to Noto Sans SC from Google Fonts when no system font is available (#48)
+- Font registration errors no longer cache invalid font data — `loadFont` only caches after successful CanvasKit registration
+- Fix `render` tool failing on Windows + Bun with "Cannot find module" error (#43)
+- Fix hover highlighting nodes from internal component pages — scope hit-test to current page
+- Fix hit-testing on transparent frames and groups — empty containers without fills or strokes are now click-through, clipping parents reject hits outside their bounds, matching Figma behavior
+- Fix instance overrides on .fig import and clipboard paste — resolve guidPaths by overrideKey, handle component swaps (`overriddenSymbolID`), propagate through nested clone chains. Import and paste now share a single override engine.
+- Apply Figma component property assignments on import — boolean visibility toggles and instance swaps via `componentPropRefs`/`componentPropAssignments`
+- Apply `derivedSymbolData` sizes on import — containers now shrink correctly when component properties hide children
+- Fix override resolution for nested instance targets — check the current node before searching descendants
+- Fix component property assignments for nested instances — resolve scoped `componentPropAssignments` inside `symbolOverrides` via guidPath, handle `guidValue` for instance swaps, reorder phases so transitive sync doesn't clobber visibility
+- Pixel-perfect vector rendering using pre-computed `fillGeometry`/`strokeGeometry` blobs from .fig files — eliminates white gaps between adjacent stroked shapes
+- Stroke outlines on clipboard paste — convert vectorNetwork paths to filled outlines via CanvasKit when geometry blobs are unavailable
+- Apply `derivedSymbolData` transforms and geometry during import — instance children render at correct scale and position
+- Fix internal pages becoming visible after .fig round-trip — preserve `internalOnly` flag on export
+- Scope layout recomputation to current page for paste/undo/font-load (major speedup on large multi-page files)
+- Show loading overlay until all document fonts are loaded (no more partially rendered text)
+- Load fonts when switching pages (previously only loaded for the first page)
+- Always show visibility toggle on fill, stroke, and effect rows (matches Figma)
+- Fix renderer crash on double destroy when closing files quickly
+- Fix .fig page ordering — use deterministic byte comparison for fractional index positions
+- Fix text truncation using `textTruncation` field instead of `textAutoResize`
+- Fix horizontal scrollbar on design and pages panels
+- Style scrollbars for Tauri (thin dark overlay instead of default OS chrome)
+- Enable file watcher in Tauri — `watch` feature was missing from `tauri-plugin-fs`
+
+## 0.6.0 — 2026-03-04
+
 ### Features
 
 - Multi-selection properties panel — edit position, size, appearance, fill, stroke, and effects across multiple selected nodes
@@ -9,13 +54,32 @@
 - W/H inputs in multi-selection mode
 - Flip horizontal/vertical using scale transform instead of rotation
 - Single-node alignment aligns to parent frame bounds
+- ACP agent package — Agent Communication Protocol server for AI coding tools, reusing core ToolDefs
 
-### Docs
+### Build
 
-- Add macOS Gatekeeper workaround (`xattr -cr`) to README and docs for unsigned app warning
+- Apple code signing and notarization for macOS builds
+- Git LFS storage moved from GitHub to Cloudflare R2
+
 
 ### Fixes
 
+- Fix Figma clipboard paste: extract shared kiwi→SceneNode conversion, fixing broken auto-layout, missing gradient/image fills, effects, style runs, and text properties
+- Fix vector rendering on paste — scale path coordinates from Figma's normalizedSize to actual node bounds
+- Fix pasted instances having no children — populate from component via symbolData when both are in clipboard
+- Detect component sets on import — promote FRAME nodes with VARIANT componentPropDefs to COMPONENT_SET
+- Skip internal canvas on paste — components on Figma's hidden internal page populate instances but are not pasted as visible nodes
+- Apply instance overrides on paste — text content, fills, visibility, layoutGrow, and textAutoResize from symbolOverrides
+- Fix auto-layout child ordering — sort by geometric position instead of z-order position strings
+- Load fonts on paste and .fig import — collect font families from text nodes and load into CanvasKit
+- Text measurement in auto-layout — use CanvasKit paragraph metrics for WIDTH_AND_HEIGHT text nodes
+- Recompute layouts after font loading completes
+- Fix PERCENT line height conversion — was stored as raw value instead of pixels
+- Fix InvalidCharacterError when copying nodes with non-ASCII text
+- Load all font weight/style variants needed by pasted text nodes
+- Fix font loading not registering in core cache
+- Fix halfLeading applied to text measurement — enable only for rendering
+- Clear hover on zoom/pinch to keep scene picture cache valid
 - Fix flip buttons using rotation math instead of actual mirroring
 - Fix flip transform encoding — scale first matrix column only (was incorrectly producing 180° rotation)
 - Decode flip state from .fig transform matrix on import

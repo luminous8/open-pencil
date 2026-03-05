@@ -1,7 +1,5 @@
 import { inflateSync, deflateSync } from 'fflate'
 
-import { BLACK } from './constants'
-import { styleToWeight } from './fonts'
 import {
   sceneNodeToKiwi,
   buildFigKiwi,
@@ -10,20 +8,12 @@ import {
 } from './kiwi-serialize'
 import { initCodec, getCompiledSchema, getSchemaBytes } from './kiwi/codec'
 import { decodeBinarySchema, compileSchema, ByteBuffer } from './kiwi/kiwi-schema'
-import { decodeVectorNetworkBlob } from './vector'
+import { nodeChangeToProps, sortChildren } from './kiwi/kiwi-convert'
+import { populateAndApplyOverrides } from './kiwi/instance-overrides'
+import type { InstanceNodeChange } from './kiwi/instance-overrides'
 
 import type { NodeChange as KiwiNodeChange } from './kiwi/codec'
-import type {
-  SceneGraph,
-  SceneNode,
-  Fill,
-  Stroke,
-  LayoutMode,
-  LayoutSizing,
-  LayoutAlign,
-  LayoutCounterAlign,
-  VectorNetwork
-} from './scene-graph'
+import type { SceneGraph, SceneNode } from './scene-graph'
 
 interface FigmaClipboardMeta {
   fileKey: string
@@ -33,23 +23,6 @@ interface FigmaClipboardMeta {
 
 export async function prefetchFigmaSchema(): Promise<void> {
   await initCodec()
-}
-
-function binaryToBase64(bytes: Uint8Array): string {
-  let binary = ''
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i])
-  }
-  return btoa(binary)
-}
-
-function base64ToBinary(b64: string): Uint8Array {
-  const raw = atob(b64)
-  const bytes = new Uint8Array(raw.length)
-  for (let i = 0; i < raw.length; i++) {
-    bytes[i] = raw.charCodeAt(i)
-  }
-  return bytes
 }
 
 // --- Paste from Figma ---
@@ -62,7 +35,7 @@ export async function parseFigmaClipboard(
   if (!metaMatch || !bufMatch) return null
 
   const meta: FigmaClipboardMeta = JSON.parse(atob(metaMatch[1]))
-  const binary = base64ToBinary(bufMatch[1])
+  const binary = Uint8Array.fromBase64(bufMatch[1])
 
   const chunks = parseFigKiwiChunks(binary)
   if (!chunks) return null
@@ -81,27 +54,6 @@ export async function parseFigmaClipboard(
   )
 
   return { nodes: msg.nodeChanges ?? [], meta, blobs }
-}
-
-function decodeVectorData(nc: KiwiNodeChange, blobs: Uint8Array[]): VectorNetwork | null {
-  const vectorData = nc.vectorData as
-    | {
-        vectorNetworkBlob?: number
-        normalizedSize?: { x: number; y: number }
-        styleOverrideTable?: Array<{ styleID: number; handleMirroring?: string }>
-      }
-    | undefined
-
-  if (!vectorData || vectorData.vectorNetworkBlob === undefined) return null
-
-  const blobIdx = vectorData.vectorNetworkBlob
-  if (blobIdx < 0 || blobIdx >= blobs.length) return null
-
-  try {
-    return decodeVectorNetworkBlob(blobs[blobIdx], vectorData.styleOverrideTable)
-  } catch {
-    return null
-  }
 }
 
 const NON_VISUAL_TYPES = new Set([
@@ -181,7 +133,24 @@ export function importClipboardNodes(
     }
   }
 
+  const internalCanvasIds = new Set<string>()
+  for (const [id, nc] of guidMap) {
+    if (nc.type === 'CANVAS' && (nc as unknown as Record<string, unknown>).internalOnly) {
+      internalCanvasIds.add(id)
+    }
+  }
+
+  const internalFigmaIds = new Set<string>()
+  function markInternal(id: string) {
+    internalFigmaIds.add(id)
+    for (const [childId, pid] of parentMap) {
+      if (pid === id && !internalFigmaIds.has(childId)) markInternal(childId)
+    }
+  }
+  for (const canvasId of internalCanvasIds) markInternal(canvasId)
+
   const topLevel: string[] = []
+  const internalTopLevel: string[] = []
   for (const [id, nc] of guidMap) {
     if (NON_VISUAL_TYPES.has(nc.type ?? '')) continue
     const parentId = parentMap.get(id)
@@ -190,7 +159,11 @@ export function importClipboardNodes(
       !guidMap.has(parentId) ||
       NON_VISUAL_TYPES.has(guidMap.get(parentId)?.type ?? '')
     ) {
-      topLevel.push(id)
+      if (parentId && internalCanvasIds.has(parentId)) {
+        internalTopLevel.push(id)
+      } else {
+        topLevel.push(id)
+      }
     }
   }
 
@@ -202,99 +175,18 @@ export function importClipboardNodes(
     const nc = guidMap.get(figmaId)
     if (!nc) return
 
-    const x = (nc.transform?.m02 ?? 0) + (ourParentId === targetParentId ? offsetX : 0)
-    const y = (nc.transform?.m12 ?? 0) + (ourParentId === targetParentId ? offsetY : 0)
+    const { nodeType, ...props } = nodeChangeToProps(nc, blobs)
+    if (nodeType === 'DOCUMENT' || nodeType === 'VARIABLE') return
 
-    let rotation = 0
-    if (nc.transform) {
-      rotation = Math.atan2(nc.transform.m10, nc.transform.m00) * (180 / Math.PI)
+    if (ourParentId === targetParentId) {
+      props.x = (props.x ?? 0) + offsetX
+      props.y = (props.y ?? 0) + offsetY
     }
 
-    const fills: Fill[] = (nc.fillPaints ?? [])
-      .filter((p) => p.type === 'SOLID' && p.color)
-      .map((p) => ({
-        type: 'SOLID' as const,
-        color: p.color ?? { ...BLACK },
-        opacity: p.opacity ?? 1,
-        visible: p.visible ?? true
-      }))
-
-    const strokes: Stroke[] = (nc.strokePaints ?? [])
-      .filter((p) => p.type === 'SOLID' && p.color)
-      .map((p) => ({
-        color: p.color ?? { ...BLACK },
-        weight: nc.strokeWeight ?? 1,
-        opacity: p.opacity ?? 1,
-        visible: p.visible ?? true,
-        align: 'CENTER' as const
-      }))
-
-    const nodeType = mapNodeType(nc.type)
-    const node = graph.createNode(nodeType, ourParentId, {
-      name: nc.name ?? nodeType,
-      x,
-      y,
-      width: nc.size?.x ?? 100,
-      height: nc.size?.y ?? 100,
-      rotation,
-      opacity: nc.opacity ?? 1,
-      visible: nc.visible ?? true,
-      fills,
-      strokes,
-      cornerRadius: nc.cornerRadius ?? 0,
-      independentCorners: nc.rectangleCornerRadiiIndependent ?? false,
-      topLeftRadius: nc.rectangleTopLeftCornerRadius ?? 0,
-      topRightRadius: nc.rectangleTopRightCornerRadius ?? 0,
-      bottomLeftRadius: nc.rectangleBottomLeftCornerRadius ?? 0,
-      bottomRightRadius: nc.rectangleBottomRightCornerRadius ?? 0,
-      text: nc.textData?.characters ?? '',
-      fontSize: nc.fontSize ?? 14,
-      fontFamily: nc.fontName?.family ?? 'Inter',
-      textAlignHorizontal:
-        (nc.textAlignHorizontal as 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFIED') ?? 'LEFT',
-      layoutMode: mapLayoutMode(nc.stackMode as string),
-      itemSpacing: (nc.stackSpacing as number) ?? 0,
-      paddingTop: (nc.stackVerticalPadding as number) ?? (nc.stackPadding as number) ?? 0,
-      paddingBottom:
-        (nc.stackPaddingBottom as number) ??
-        (nc.stackVerticalPadding as number) ??
-        (nc.stackPadding as number) ??
-        0,
-      paddingLeft: (nc.stackHorizontalPadding as number) ?? (nc.stackPadding as number) ?? 0,
-      paddingRight:
-        (nc.stackPaddingRight as number) ??
-        (nc.stackHorizontalPadding as number) ??
-        (nc.stackPadding as number) ??
-        0,
-      primaryAxisSizing: mapSizing(nc.stackPrimarySizing as string),
-      counterAxisSizing: mapSizing(nc.stackCounterSizing as string),
-      primaryAxisAlign: mapPrimaryAlign(
-        (nc.stackPrimaryAlignItems as string) ?? (nc.stackJustify as string)
-      ),
-      counterAxisAlign: mapCounterAlign(
-        (nc.stackCounterAlignItems as string) ?? (nc.stackCounterAlign as string)
-      ),
-      layoutWrap: (nc.stackWrap as string) === 'WRAP' ? ('WRAP' as const) : ('NO_WRAP' as const),
-      counterAxisSpacing: (nc.stackCounterSpacing as number) ?? 0,
-      layoutPositioning:
-        (nc.stackPositioning as string) === 'ABSOLUTE' ? ('ABSOLUTE' as const) : ('AUTO' as const),
-      layoutGrow: (nc.stackChildPrimaryGrow as number) ?? 0,
-      layoutAlignSelf:
-        (nc.stackChildAlignSelf as string) === 'STRETCH' ? ('STRETCH' as const) : ('AUTO' as const),
-      clipsContent: nc.frameMaskDisabled === false,
-      textAutoResize: 'NONE' as const,
-      fontWeight: nc.fontWeight ?? styleToWeight(nc.fontName?.style ?? ''),
-      italic: nc.fontName?.style?.toLowerCase().includes('italic') ?? false,
-      lineHeight: mapLineHeight(nc.lineHeight as { value: number; units: string } | undefined),
-      letterSpacing: mapLetterSpacing(
-        nc.letterSpacing as { value: number; units: string } | undefined,
-        nc.fontSize as number | undefined
-      ),
-      vectorNetwork: decodeVectorData(nc, blobs)
-    })
+    const node = graph.createNode(nodeType, ourParentId, props)
 
     created.set(figmaId, node.id)
-    if (ourParentId === targetParentId) createdIds.push(node.id)
+    if (ourParentId === targetParentId && !internalFigmaIds.has(figmaId)) createdIds.push(node.id)
 
     const children: string[] = []
     for (const [childId, pid] of parentMap) {
@@ -302,97 +194,40 @@ export function importClipboardNodes(
         children.push(childId)
       }
     }
-    children.sort((a, b) => {
-      const aPos = guidMap.get(a)?.parentIndex?.position ?? ''
-      const bPos = guidMap.get(b)?.parentIndex?.position ?? ''
-      return aPos.localeCompare(bPos)
-    })
+    sortChildren(children, nc, guidMap)
     for (const childId of children) {
       createNode(childId, node.id)
     }
   }
 
+  for (const id of internalTopLevel) {
+    createNode(id, targetParentId)
+  }
   for (const id of topLevel) {
     createNode(id, targetParentId)
   }
 
-  return createdIds
-}
-
-function mapLayoutMode(mode?: string): LayoutMode {
-  if (mode === 'HORIZONTAL') return 'HORIZONTAL'
-  if (mode === 'VERTICAL') return 'VERTICAL'
-  return 'NONE'
-}
-
-function mapSizing(sizing?: string): LayoutSizing {
-  if (sizing === 'RESIZE_TO_FIT' || sizing === 'RESIZE_TO_FIT_WITH_IMPLICIT_SIZE') return 'HUG'
-  if (sizing === 'FILL') return 'FILL'
-  return 'FIXED'
-}
-
-function mapPrimaryAlign(align?: string): LayoutAlign {
-  if (align === 'CENTER') return 'CENTER'
-  if (align === 'MAX') return 'MAX'
-  if (align === 'SPACE_BETWEEN' || align === 'SPACE_EVENLY') return 'SPACE_BETWEEN'
-  return 'MIN'
-}
-
-function mapCounterAlign(align?: string): LayoutCounterAlign {
-  if (align === 'CENTER') return 'CENTER'
-  if (align === 'MAX') return 'MAX'
-  if (align === 'STRETCH') return 'STRETCH'
-  if (align === 'BASELINE') return 'BASELINE'
-  return 'MIN'
-}
-
-function mapLetterSpacing(ls?: { value: number; units: string }, fontSize?: number): number {
-  if (!ls) return 0
-  if (ls.units === 'PIXELS') return ls.value
-  if (ls.units === 'PERCENT') return (ls.value / 100) * (fontSize ?? 14)
-  return 0
-}
-
-function mapLineHeight(lh?: { value: number; units: string }): number | undefined {
-  if (!lh) return undefined
-  if (lh.units === 'PIXELS') return lh.value
-  if (lh.units === 'PERCENT') return undefined
-  return undefined
-}
-
-function mapNodeType(type?: string): SceneNode['type'] {
-  switch (type) {
-    case 'FRAME':
-      return 'FRAME'
-    case 'COMPONENT':
-      return 'COMPONENT'
-    case 'COMPONENT_SET':
-      return 'COMPONENT_SET'
-    case 'INSTANCE':
-      return 'INSTANCE'
-    case 'RECTANGLE':
-    case 'ROUNDED_RECTANGLE':
-      return 'RECTANGLE'
-    case 'ELLIPSE':
-      return 'ELLIPSE'
-    case 'TEXT':
-      return 'TEXT'
-    case 'LINE':
-      return 'LINE'
-    case 'STAR':
-      return 'STAR'
-    case 'REGULAR_POLYGON':
-      return 'POLYGON'
-    case 'VECTOR':
-    case 'BOOLEAN_OPERATION':
-      return 'VECTOR'
-    case 'GROUP':
-      return 'GROUP'
-    case 'SECTION':
-      return 'SECTION'
-    default:
-      return 'RECTANGLE'
+  // Remap componentId from original Figma GUIDs to our node IDs
+  for (const [, ourId] of created) {
+    const node = graph.getNode(ourId)
+    if (!node || node.type !== 'INSTANCE' || !node.componentId) continue
+    const ourComponentId = created.get(node.componentId)
+    if (ourComponentId) graph.updateNode(ourId, { componentId: ourComponentId })
   }
+
+  populateAndApplyOverrides(
+    graph,
+    guidMap as unknown as Map<string, InstanceNodeChange>,
+    created,
+    blobs
+  )
+
+  for (const figmaId of internalTopLevel) {
+    const ourId = created.get(figmaId)
+    if (ourId) graph.deleteNode(ourId)
+  }
+
+  return createdIds
 }
 
 export function buildFigmaClipboardHTML(nodes: SceneNode[], graph: SceneGraph): string | null {
@@ -445,7 +280,7 @@ export function buildFigmaClipboardHTML(nodes: SceneNode[], graph: SceneGraph): 
 
   const dataRaw = compiled.encodeMessage(msg)
   const figKiwiBinary = buildFigKiwi(schemaDeflated, dataRaw)
-  const bufferB64 = binaryToBase64(figKiwiBinary)
+  const bufferB64 = figKiwiBinary.toBase64()
 
   const meta: FigmaClipboardMeta = {
     fileKey: 'openpencil',
@@ -470,7 +305,7 @@ export function parseOpenPencilClipboard(
   if (!match) return null
 
   try {
-    const decoded = JSON.parse(atob(match[1]))
+    const decoded = JSON.parse(new TextDecoder().decode(Uint8Array.fromBase64(match[1])))
     if (decoded.format === 'openpencil/v1' && Array.isArray(decoded.nodes)) {
       restoreTextPictures(decoded.nodes)
       return decoded.nodes
@@ -484,7 +319,7 @@ export function parseOpenPencilClipboard(
 function restoreTextPictures(nodes: Array<Record<string, unknown>>): void {
   for (const node of nodes) {
     if (typeof node.textPicture === 'string') {
-      node.textPicture = base64ToBinary(node.textPicture)
+      node.textPicture = Uint8Array.fromBase64(node.textPicture)
     }
     if (Array.isArray(node.children)) {
       restoreTextPictures(node.children)
@@ -503,7 +338,7 @@ export function buildOpenPencilClipboardHTML(
     format: 'openpencil/v1',
     nodes: collectNodeTree(nodes, graph, textPictureBuilder)
   }
-  return `<!--(openpencil)${btoa(JSON.stringify(data))}(/openpencil)-->`
+  return `<!--(openpencil)${new TextEncoder().encode(JSON.stringify(data)).toBase64()}(/openpencil)-->`
 }
 
 function collectNodeTree(
@@ -517,7 +352,7 @@ function collectNodeTree(
 
     if (node.type === 'TEXT' && node.text && textPictureBuilder) {
       const pic = node.textPicture ?? textPictureBuilder(node)
-      if (pic) serialized.textPicture = binaryToBase64(pic)
+      if (pic) serialized.textPicture = pic.toBase64()
     } else {
       delete serialized.textPicture
     }
